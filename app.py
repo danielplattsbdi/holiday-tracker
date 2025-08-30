@@ -1,14 +1,14 @@
 import pandas as pd
 import streamlit as st
-import calendar, datetime as dt, html, re
+import calendar, datetime as dt, html, re, requests
 
 # ================= CONFIG =================
 # Requests tab (gid=231607063)
-REQUESTS_URL_EDIT = "https://docs.google.com/spreadsheets/d/1Ho_xH8iESP0HVTeXKFe2gyWOg18kcMFKrLvEi2wNyMs/edit?gid=2316071603".replace("2316071603","231607063")
+REQUESTS_URL_EDIT = "https://docs.google.com/spreadsheets/d/1Ho_xH8iESP0HVTeXKFe2gyWOg18kcMFKrLvEi2wNyMs/edit?gid=231607063"
 # Team tab (roster, gid=1533771603)
 TEAM_URL_EDIT     = "https://docs.google.com/spreadsheets/d/1Ho_xH8iESP0HVTeXKFe2gyWOg18kcMFKrLvEi2wNyMs/edit?gid=1533771603"
-# OPTIONAL: Bank holidays tab (one column: Date)
-BANK_URL_EDIT     = ""  # put in Secrets below if using
+# OPTIONAL: Bank holidays tab (add a tab with a single column 'Date')
+BANK_URL_EDIT     = ""  # set in Streamlit Secrets if you create it
 
 # (optional) override via Streamlit Secrets
 REQUESTS_URL_EDIT = st.secrets.get("SHEET_URL_REQUESTS", REQUESTS_URL_EDIT)
@@ -103,23 +103,42 @@ def load_team() -> list[str]:
     names = rdf["Team Member"].dropna().astype(str).map(lambda s: re.sub(r"\s+"," ",s).strip())
     return sorted(pd.unique(names).tolist())
 
-@st.cache_data(ttl=300)
-def load_bank_holidays() -> set[pd.Timestamp]:
-    """Optional bank holidays from a Sheet tab with a column 'Date'."""
-    if not BANK_URL_EDIT:
+@st.cache_data(ttl=86400)
+def fetch_govuk_bank_holidays(region_key: str) -> set[pd.Timestamp]:
+    """
+    Fetch UK bank holidays from GOV.UK JSON feed.
+    region_key in: 'england-and-wales', 'scotland', 'northern-ireland'
+    """
+    try:
+        r = requests.get("https://www.gov.uk/bank-holidays.json", timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        events = data.get(region_key, {}).get("events", [])
+        dates = pd.to_datetime([e["date"] for e in events], errors="coerce").dropna().dt.normalize()
+        return set(dates.tolist())
+    except Exception:
         return set()
+
+@st.cache_data(ttl=300)
+def load_bank_holidays(region_key: str) -> set[pd.Timestamp]:
+    """Union of GOV.UK BH for region + optional Sheet tab with extra dates."""
+    gov = fetch_govuk_bank_holidays(region_key)
+    if not BANK_URL_EDIT:
+        return gov
+    # Optional extra/override dates from user sheet
     url = to_csv_export_url(BANK_URL_EDIT)
     df = read_csv(url)
-    if df.empty: return set()
-    # try to find a date column
+    if df.empty: 
+        return gov
+    # find a date column
     col = None
     for c in df.columns:
         if str(c).strip().lower() in {"date","dates"}:
             col = c; break
     if col is None:
         col = df.columns[0]
-    dates = pd.to_datetime(df[col], dayfirst=True, errors="coerce").dropna().dt.normalize()
-    return set(dates.tolist())
+    sheet_dates = pd.to_datetime(df[col], dayfirst=True, errors="coerce").dropna().dt.normalize()
+    return gov.union(set(sheet_dates.tolist()))
 
 def explode_days(df: pd.DataFrame) -> pd.DataFrame:
     """Row per member/day with Type (for display)."""
@@ -134,7 +153,7 @@ def explode_days(df: pd.DataFrame) -> pd.DataFrame:
             cur += dt.timedelta(days=1)
     return pd.DataFrame(out)
 
-# ================= UI HEADER =================
+# ================= UI HEADER & LAYOUT =================
 st.set_page_config(page_title="BDI Holiday & Sickness", layout="wide")
 
 # Centered container & tighter spacing
@@ -160,12 +179,10 @@ with col_title:
     st.markdown("## **BDI Holiday & Sickness Tracker**")
     st.caption("Reach. Recruit. Relocate.")
 
-# ================= DATA =================
+# ================= DATA & CONTROLS =================
 df_req = load_requests()
 team_members = load_team()
-bank_holidays = load_bank_holidays()  # set of normalized timestamps
 
-# Year/month controls (robust if df empty)
 now = dt.datetime.now()
 if df_req.empty:
     year_min = now.year - 1
@@ -175,20 +192,34 @@ else:
     year_max = int(max(df_req["From (Date)"].dt.year.max(), df_req["Until (Date)"].dt.year.max(), now.year)) + 1
 
 years = list(range(year_min, year_max + 1))
-c1, c2 = st.columns(2)
+c1, c2, c3 = st.columns([1,1,2])
 with c1:
     year = st.selectbox("Year", years, index=years.index(now.year) if now.year in years else 0)
 with c2:
     month = st.selectbox("Month", list(calendar.month_name)[1:], index=now.month-1)
+with c3:
+    region_label = st.selectbox(
+        "UK region for bank holidays",
+        ["England & Wales", "Scotland", "Northern Ireland"],
+        index=0
+    )
+region_key = {
+    "England & Wales": "england-and-wales",
+    "Scotland": "scotland",
+    "Northern Ireland": "northern-ireland"
+}[region_label]
 
-# ================= TRANSFORM =================
+bank_holidays = load_bank_holidays(region_key)  # set of normalized timestamps
 df_days = explode_days(df_req)
 
+def is_bank_holiday(ts: pd.Timestamp) -> bool:
+    return bool(bank_holidays) and ts.normalize() in bank_holidays
+
 def is_working_day(ts: pd.Timestamp) -> bool:
-    """Mon–Fri and not a bank holiday (if provided)."""
-    if ts.weekday() >= 5:  # weekend
+    """Mon–Fri and not a bank holiday."""
+    if ts.weekday() >= 5:
         return False
-    if bank_holidays and ts.normalize() in bank_holidays:
+    if is_bank_holiday(ts):
         return False
     return True
 
@@ -213,7 +244,7 @@ today = pd.Timestamp.now().normalize()
 # ================= RENDER TABLE =================
 # header
 head = ["<th style='min-width:220px;text-align:left'>Member</th>"] + [
-    f"<th style='padding:6px 4px; width:28px; background:{WEEKEND if d.weekday()>=5 else '#fff'}'>{d.day}</th>"
+    f"<th style='padding:6px 4px; width:28px; background:{WEEKEND if (d.weekday()>=5 or is_bank_holiday(d)) else '#fff'}'>{d.day}</th>"
     for d in dates
 ]
 
@@ -226,14 +257,16 @@ for m in team_members:
     # member's records for month (speed-up lookup)
     md = df_days[df_days["Member"]==m]
     for d in dates:
-        bg = WEEKEND if d.weekday()>=5 else "#fff"
+        # weekend / bank holiday shading
+        is_bh = is_bank_holiday(d)
+        bg = WEEKEND if (d.weekday()>=5 or is_bh) else "#fff"
         border = f"2px dashed {MUTED}" if d==today else GRID
+
         rec = md[md["Date"]==d]
-        if not rec.empty:
+        if not rec.empty and (d.weekday() < 5 and not is_bh):  # paint only Mon–Fri and not bank holidays
             t = rec.iloc[0]["Type"]
             color = TYPE_COLORS.get(t, PRIMARY)
             label = TYPE_LABELS.get(t, "")
-            # visually still show weekends as part of a block, but allowance ignores them
             row.append(f"<td style='background:{color};color:#fff;text-align:center;width:28px'>{label}</td>")
         else:
             row.append(f"<td style='background:{bg};border:1px solid {border};width:28px'></td>")
@@ -255,7 +288,8 @@ st.markdown(
       <b>Legend:</b>
       <span style='background:{PRIMARY};color:#fff;padding:2px 6px;border-radius:4px;'>AL</span> Annual Leave &nbsp;
       <span style='background:{SICK};color:#fff;padding:2px 6px;border-radius:4px;'>S</span> Sickness &nbsp;
-      <span style='display:inline-block;width:18px;height:14px;background:{WEEKEND};border:1px solid {GRID};border-radius:3px;vertical-align:middle'></span> Weekend
+      <span style='display:inline-block;width:18px;height:14px;background:{WEEKEND};border:1px solid {GRID};border-radius:3px;vertical-align:middle'></span>
+      Weekend / Bank holiday
     </div>
     """,
     unsafe_allow_html=True
