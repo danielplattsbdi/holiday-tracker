@@ -103,26 +103,26 @@ def load_team() -> list[str]:
     names = rdf["Team Member"].dropna().astype(str).map(lambda s: re.sub(r"\s+"," ",s).strip())
     return sorted(pd.unique(names).tolist())
 
-@st.cache_data(ttl=86400)
-def fetch_govuk_bank_holidays(region_key: str) -> set[pd.Timestamp]:
-    """
-    Fetch UK bank holidays from GOV.UK JSON feed.
-    region_key in: 'england-and-wales', 'scotland', 'northern-ireland'
-    """
+# ---------- GOV.UK bank holidays (England & Wales only) ----------
+ENG_WALES_KEY = "england-and-wales"
+
+@st.cache_data(ttl=86400)  # cache for 1 day
+def fetch_govuk_bank_holidays_eng() -> set[pd.Timestamp]:
+    """Fetch England & Wales bank holidays from GOV.UK JSON feed."""
     try:
         r = requests.get("https://www.gov.uk/bank-holidays.json", timeout=10)
         r.raise_for_status()
         data = r.json()
-        events = data.get(region_key, {}).get("events", [])
+        events = data.get(ENG_WALES_KEY, {}).get("events", [])
         dates = pd.to_datetime([e["date"] for e in events], errors="coerce").dropna().dt.normalize()
         return set(dates.tolist())
     except Exception:
         return set()
 
 @st.cache_data(ttl=300)
-def load_bank_holidays(region_key: str) -> set[pd.Timestamp]:
-    """Union of GOV.UK BH for region + optional Sheet tab with extra dates."""
-    gov = fetch_govuk_bank_holidays(region_key)
+def load_bank_holidays() -> set[pd.Timestamp]:
+    """Union of GOV.UK (England & Wales) + optional Sheet tab with extra dates."""
+    gov = fetch_govuk_bank_holidays_eng()
     if not BANK_URL_EDIT:
         return gov
     # Optional extra/override dates from user sheet
@@ -166,6 +166,7 @@ st.markdown("""
   td:first-child, th:first-child {position:sticky; left:0; background:#fff; z-index:3;}
   .namecell {font-weight:600; text-align:left;}
   .daysleft {color:"""+MUTED+"""; font-size:11px;}
+  .pill {display:inline-block; padding:2px 6px; border:1px solid """+GRID+"""; border-radius:999px; font-size:11px; color:"""+MUTED+""";}
 </style>
 """, unsafe_allow_html=True)
 
@@ -182,6 +183,7 @@ with col_title:
 # ================= DATA & CONTROLS =================
 df_req = load_requests()
 team_members = load_team()
+bank_holidays = load_bank_holidays()  # set of normalized timestamps
 
 now = dt.datetime.now()
 if df_req.empty:
@@ -192,24 +194,23 @@ else:
     year_max = int(max(df_req["From (Date)"].dt.year.max(), df_req["Until (Date)"].dt.year.max(), now.year)) + 1
 
 years = list(range(year_min, year_max + 1))
-c1, c2, c3 = st.columns([1,1,2])
+c1, c2, c3 = st.columns([1,1,3])
 with c1:
     year = st.selectbox("Year", years, index=years.index(now.year) if now.year in years else 0)
 with c2:
     month = st.selectbox("Month", list(calendar.month_name)[1:], index=now.month-1)
 with c3:
-    region_label = st.selectbox(
-        "UK region for bank holidays",
-        ["England & Wales", "Scotland", "Northern Ireland"],
-        index=0
+    # tiny debug chip showing holidays loaded for this month
+    month_index = list(calendar.month_name).index(month)
+    start = pd.Timestamp(dt.date(year, month_index, 1))
+    end = start + pd.offsets.MonthEnd(1)
+    bh_in_month = sorted([d for d in bank_holidays if start <= d <= end])
+    st.markdown(
+        f"<span class='pill'>BH loaded for {calendar.month_name[month_index]}: "
+        f"{', '.join(d.strftime('%d %b') for d in bh_in_month) if bh_in_month else 'none'}</span>",
+        unsafe_allow_html=True
     )
-region_key = {
-    "England & Wales": "england-and-wales",
-    "Scotland": "scotland",
-    "Northern Ireland": "northern-ireland"
-}[region_label]
 
-bank_holidays = load_bank_holidays(region_key)  # set of normalized timestamps
 df_days = explode_days(df_req)
 
 def is_bank_holiday(ts: pd.Timestamp) -> bool:
@@ -236,7 +237,6 @@ def remaining_for(member: str, yr: int) -> int | float:
     return ALLOWANCE - used
 
 # Month dates
-month_index = list(calendar.month_name).index(month)
 num_days = calendar.monthrange(year, month_index)[1]
 dates = pd.date_range(dt.date(year, month_index, 1), periods=num_days)
 today = pd.Timestamp.now().normalize()
