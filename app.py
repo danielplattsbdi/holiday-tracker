@@ -1,5 +1,6 @@
 import re, html, calendar, pandas as pd, datetime as dt
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh  # <-- for timed refresh
 
 # --------------- CONFIG ---------------
 st.set_page_config(page_title="BDI Holiday & Sickness", layout="wide")
@@ -90,6 +91,7 @@ def load_data_from_gsheet(requests_url: str) -> pd.DataFrame:
     df = read_sheet_tab(requests_url)
     if df.empty: return df
     df = df.rename(columns=lambda c: re.sub(r"\s+"," ",str(c)).strip())
+    # pandas >=2.2: DataFrame.map applies elementwise
     df = df.map(lambda v: v.strip() if isinstance(v, str) else v)
     for c in [COLS["member"], COLS["type"], COLS["from_date"], COLS["until_date"], COLS["start_time"], COLS["end_time"], COLS["office"], COLS["manager"], COLS["notes"]]:
         if c not in df.columns: df[c] = None
@@ -175,7 +177,7 @@ def fmt_days(x):
 # --------------- UI HEADER ---------------
 col_logo, col_title = st.columns([1,6])
 with col_logo:
-    st.image(LOGO_URL, use_column_width=True)
+    st.image(LOGO_URL, use_container_width=True)  # <- updated param
 with col_title:
     st.markdown(f"""
     <div style="font:600 24px system-ui; color:{INK}; margin-top:4px">BDI Holiday & Sickness Calendar</div>
@@ -183,7 +185,7 @@ with col_title:
     """, unsafe_allow_html=True)
 
 # Auto-refresh every 60s so new form entries appear
-st.autorefresh(interval=60_000, key="auto_refresh")
+st_autorefresh(interval=60 * 1000, key="auto_refresh")
 
 # --------------- LOAD DATA ---------------
 df_requests = load_data_from_gsheet(SHEET_URL_REQUESTS)
