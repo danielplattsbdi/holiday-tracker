@@ -25,7 +25,8 @@ DAY_END   = dt.time(17,30)
 LUNCH     = dt.time(13,0)
 
 # Replace with your Google Sheet CSV export
-SHEET_URL = st.secrets["google_sheet_url"]
+SHEET_URL = "https://docs.google.com/spreadsheets/d/1Ho_xH8iESP0HVTeXKFe2gyWOg18kcMFKrLvEi2wNyMs/gviz/tq?tqx=out:csv&sheet=Requests"
+
 
 # ============ FETCH GOV.UK BANK HOLIDAYS ============
 @st.cache_data(ttl=86400)
