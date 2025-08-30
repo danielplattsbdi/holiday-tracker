@@ -10,7 +10,7 @@ TEAM_URL_EDIT     = "https://docs.google.com/spreadsheets/d/1Ho_xH8iESP0HVTeXKFe
 # OPTIONAL: Bank holidays tab (add a tab with a single column 'Date')
 BANK_URL_EDIT     = ""  # set in Streamlit Secrets if you create it
 
-# (optional) override via Streamlit Secrets
+# (optional) override via Streamlit Secrets (kept as-is)
 REQUESTS_URL_EDIT = st.secrets.get("SHEET_URL_REQUESTS", REQUESTS_URL_EDIT)
 TEAM_URL_EDIT     = st.secrets.get("SHEET_URL_TEAM", TEAM_URL_EDIT)
 BANK_URL_EDIT     = st.secrets.get("SHEET_URL_BANKHOLIDAYS", BANK_URL_EDIT)
@@ -107,29 +107,42 @@ def load_team() -> list[str]:
 ENG_WALES_KEY = "england-and-wales"
 
 @st.cache_data(ttl=86400)  # cache for 1 day
-def fetch_govuk_bank_holidays_eng() -> set[pd.Timestamp]:
-    """Fetch England & Wales bank holidays from GOV.UK JSON feed."""
+def fetch_govuk_bank_holidays_eng() -> pd.DatetimeIndex:
+    """
+    Fetch England & Wales bank holidays from GOV.UK JSON feed.
+    Returns a normalized DatetimeIndex (no .dt used anywhere).
+    """
     try:
         r = requests.get("https://www.gov.uk/bank-holidays.json", timeout=10)
         r.raise_for_status()
         data = r.json()
         events = data.get(ENG_WALES_KEY, {}).get("events", [])
-        dates = pd.to_datetime([e["date"] for e in events], errors="coerce").dropna().dt.normalize()
-        return set(dates.tolist())
-    except Exception:
-        return set()
+        # DatetimeIndex (not Series), then normalize without .dt
+        idx = pd.to_datetime([e["date"] for e in events], errors="coerce")
+        idx = idx.dropna().normalize()
+        # Tiny informational chip so you can see it worked
+        if len(idx) > 0:
+            st.info(f"GOV.UK bank holidays loaded: {len(idx)} dates (E&W)")
+        else:
+            st.warning("GOV.UK bank holidays returned no dates")
+        return idx
+    except Exception as e:
+        st.warning(f"GOV.UK bank holiday fetch failed: {e}")
+        return pd.DatetimeIndex([])
 
 @st.cache_data(ttl=300)
 def load_bank_holidays() -> set[pd.Timestamp]:
     """Union of GOV.UK (England & Wales) + optional Sheet tab with extra dates."""
-    gov = fetch_govuk_bank_holidays_eng()
+    gov_idx = fetch_govuk_bank_holidays_eng()         # DatetimeIndex
+    gov = set(gov_idx.to_pydatetime())                # -> set of python datetimes (naive)
     if not BANK_URL_EDIT:
-        return gov
+        return {pd.Timestamp(d) for d in gov}
+
     # Optional extra/override dates from user sheet
     url = to_csv_export_url(BANK_URL_EDIT)
     df = read_csv(url)
-    if df.empty: 
-        return gov
+    if df.empty:
+        return {pd.Timestamp(d) for d in gov}
     # find a date column
     col = None
     for c in df.columns:
@@ -137,8 +150,10 @@ def load_bank_holidays() -> set[pd.Timestamp]:
             col = c; break
     if col is None:
         col = df.columns[0]
-    sheet_dates = pd.to_datetime(df[col], dayfirst=True, errors="coerce").dropna().dt.normalize()
-    return gov.union(set(sheet_dates.tolist()))
+    sheet_idx = pd.to_datetime(df[col], dayfirst=True, errors="coerce").dropna().dt.normalize()
+    sheet = set(sheet_idx.to_pydatetime())
+    merged = {pd.Timestamp(d) for d in (gov.union(sheet))}
+    return merged
 
 def explode_days(df: pd.DataFrame) -> pd.DataFrame:
     """Row per member/day with Type (for display)."""
@@ -183,7 +198,7 @@ with col_title:
 # ================= DATA & CONTROLS =================
 df_req = load_requests()
 team_members = load_team()
-bank_holidays = load_bank_holidays()  # set of normalized timestamps
+bank_holidays = load_bank_holidays()  # set of normalized pd.Timestamp (naive)
 
 now = dt.datetime.now()
 if df_req.empty:
@@ -207,14 +222,15 @@ with c3:
     bh_in_month = sorted([d for d in bank_holidays if start <= d <= end])
     st.markdown(
         f"<span class='pill'>BH loaded for {calendar.month_name[month_index]}: "
-        f"{', '.join(d.strftime('%d %b') for d in bh_in_month) if bh_in_month else 'none'}</span>",
+        f"{', '.join(pd.to_datetime(d).strftime('%d %b') for d in bh_in_month) if bh_in_month else 'none'}</span>",
         unsafe_allow_html=True
     )
 
 df_days = explode_days(df_req)
 
 def is_bank_holiday(ts: pd.Timestamp) -> bool:
-    return bool(bank_holidays) and ts.normalize() in bank_holidays
+    # ts is naive Timestamp; bank_holidays is a set of naive Timestamps
+    return ts.normalize() in bank_holidays
 
 def is_working_day(ts: pd.Timestamp) -> bool:
     """Mon–Fri and not a bank holiday."""
