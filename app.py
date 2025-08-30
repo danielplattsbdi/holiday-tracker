@@ -10,11 +10,14 @@ TEAM_URL_EDIT     = "https://docs.google.com/spreadsheets/d/1Ho_xH8iESP0HVTeXKFe
 CANCELLATION_ENDPOINT = "https://script.google.com/macros/s/AKfycbxD8IQ2_JU6ajKY4tFUrtGYVhTTRFklCZ2q4RY0ctOKGG3lGriHFH7vhXqTbmRljAH6/exec"
 CANCEL_TOKEN          = "adfouehrgounvroung8168evs"
 
+# Google Form for new bookings
+BOOKING_FORM_URL = "https://docs.google.com/forms/d/e/1FAIpQLSeSPFiyFfHvlhNQLT3Lz9sZA29CIAlxR6FmxwPobNeG9DjzOw/viewform?usp=dialog"
+
 LOGO_URL = "https://sitescdn.wearevennture.co.uk/public/bdi-resourcing/site/live/uploads/brandmark.png"
 
 # ===== Brand / palette =====
 PRIMARY   = "#a31fea"   # Annual Leave (brand purple)
-SICK      = "#e5b3f3"   # Sickness (pale purple variant)
+SICK      = "#e5b3f3"   # Sickness (pale purple)
 WEEKEND   = "#f7f8fb"
 MUTED     = "#636672"
 INK       = "#25262b"
@@ -64,10 +67,8 @@ def load_team() -> pd.DataFrame:
     raw = read_csv(url).copy().rename(columns=lambda c: str(c).strip())
     if raw.empty:
         return pd.DataFrame(columns=["Team Member","Office"])
-    # Keep just the roster + office, normalise
     out = raw.copy()
     if "Team Member" not in out.columns:
-        # try fallbacks
         for alt in ["Name","Full Name","Member"]:
             if alt in out.columns:
                 out["Team Member"] = out[alt]
@@ -76,7 +77,6 @@ def load_team() -> pd.DataFrame:
     if "Office" not in out.columns:
         out["Office"] = "Unassigned"
     out["Office"] = out["Office"].fillna("Unassigned").astype(str).map(lambda s: s.strip().title())
-    # Optional Active flag
     for cand in ["Active","Is Active","Enabled"]:
         if cand in out.columns:
             mask = out[cand].astype(str).str.strip().str.lower().isin(["1","true","yes","y"])
@@ -136,6 +136,11 @@ def explode_days(df: pd.DataFrame) -> pd.DataFrame:
             out.append({"Member": r["Team Member"], "Date": pd.Timestamp(cur), "Type": r["Type"]})
             cur += dt.timedelta(days=1)
     return pd.DataFrame(out)
+
+def fmt_days(x):
+    if isinstance(x, (int, float)):
+        return int(x) if float(x).is_integer() else round(float(x), 1)
+    return x
 
 # ================= UI (header + layout) =================
 st.set_page_config(page_title="BDI Holiday & Sickness", layout="wide")
@@ -207,6 +212,20 @@ with st.container():
     with c3:
         office = st.selectbox("Office", offices)
 
+# Book AL button (top-right above grid)
+st.markdown(
+    f"""
+    <div style="display:flex; justify-content:flex-end; margin:6px 0 12px;">
+      <a href="{BOOKING_FORM_URL}"
+         target="_blank"
+         style="background:{PRIMARY}; color:white; font-weight:600; padding:8px 16px; border-radius:8px; text-decoration:none; font-size:14px;">
+        ➕ Book Annual Leave
+      </a>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
+
 # Month index + helpers
 month_index = list(calendar.month_name).index(month)
 dates = pd.date_range(dt.date(year, month_index, 1), periods=calendar.monthrange(year, month_index)[1])
@@ -236,12 +255,10 @@ with st.container():
     for _, r in render_team.iterrows():
         m = r["Team Member"]
         rem = remaining_for(m, year)
+        rem_txt = fmt_days(rem)
         name_html = (
             f"<div>{html.escape(m)}<span class='badge'>{html.escape(r['Office'])}</span></div>"
-            f"<div class='daysleft'>{int(rem) if rem.is_integer() if isinstance(rem,float) else rem} days left</div>"
-        ) if isinstance(rem, float) else (
-            f"<div>{html.escape(m)}<span class='badge'>{html.escape(r['Office'])}</span></div>"
-            f"<div class='daysleft'>{rem} days left</div>"
+            f"<div class='daysleft'>{rem_txt} days left</div>"
         )
         row=[f"<td class='namecell'>{name_html}</td>"]
         md = df_days[df_days["Member"]==m]
@@ -303,7 +320,6 @@ else:
     if member_reqs.empty:
         st.info(f"{sel_member} has no upcoming Annual Leave bookings.")
     else:
-        # Labels + map back to rows
         member_reqs["Label"] = member_reqs.apply(
             lambda r: f"{r['From (Date)'].strftime('%d %b %Y')} → {r['Until (Date)'].strftime('%d %b %Y')}",
             axis=1
@@ -311,7 +327,6 @@ else:
         labels = member_reqs["Label"].tolist()
         picks = st.multiselect("Choose booking(s) to cancel", options=labels)
 
-        # Small preview table (optional, nice touch)
         if picks:
             preview = (member_reqs[member_reqs["Label"].isin(picks)]
                        [["Type","From (Date)","Until (Date)"]]
