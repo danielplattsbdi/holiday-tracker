@@ -28,6 +28,10 @@ TYPE_COLORS = {"Annual Leave": PRIMARY, "Sickness": SICK}
 TYPE_LABELS = {"Annual Leave": "AL", "Sickness": "S"}
 ALLOWANCE = 25  # days per calendar year
 
+# ===== Cancellation backend config (leave blank to test UI safely) =====
+CANCELLATION_ENDPOINT = ""  # e.g. https://script.google.com/macros/s/AKfycbx.../exec
+CANCEL_TOKEN = ""           # must match your Apps Script SHARED_SECRET
+
 # ================= HELPERS =================
 def to_csv_export_url(edit_url: str) -> str:
     """Turn a Google Sheets /edit?gid=... (or /edit#gid=...) URL into a CSV export URL."""
@@ -63,14 +67,12 @@ def load_team_df() -> pd.DataFrame:
     raw = raw.rename(columns=lambda c: str(c).strip())
 
     if raw.empty:
-        # No team sheet -> empty roster (UI will show no members)
         return pd.DataFrame(columns=["Member","Office"])
 
     name_col = next((c for c in ["Team Member","Name","Full Name","Member"] if c in raw.columns), None)
     if name_col is None:
         return pd.DataFrame(columns=["Member","Office"])
 
-    # Office (optional)
     office_col = "Office" if "Office" in raw.columns else None
 
     out = pd.DataFrame({
@@ -81,7 +83,6 @@ def load_team_df() -> pd.DataFrame:
     else:
         out["Office"] = "Unassigned"
 
-    # Optional Active flag: if present, filter to truthy
     for cand in ["Active","Is Active","Enabled"]:
         if cand in raw.columns:
             mask = raw[cand].astype(str).str.strip().str.lower().isin(["1","true","yes","y"])
@@ -102,11 +103,10 @@ def load_requests() -> pd.DataFrame:
         return df
 
     df = df.rename(columns=lambda c: str(c).strip())
-    for c in ["Team Member","Type","From (Date)","Until (Date)","Line Manager","Notes"]:
+    for c in ["Team Member","Type","From (Date)","Until (Date)","Start Time","End Time","Line Manager","Notes"]:
         if c not in df.columns: 
             df[c] = None
 
-    # Dates + normalised names/types
     df["From (Date)"]  = df["From (Date)"].map(_smart_date)
     df["Until (Date)"] = df["Until (Date)"].map(_smart_date)
     df["Team Member"]  = df["Team Member"].astype(str).map(lambda s: re.sub(r"\s+"," ",s).strip())
@@ -118,14 +118,12 @@ def load_requests() -> pd.DataFrame:
         return str(x)
     df["Type"] = df["Type"].map(norm_type)
 
-    # Keep sensible rows
     df = df.dropna(subset=["Team Member","Type","From (Date)","Until (Date)"])
     df = df[df["Until (Date)"] >= df["From (Date)"]]
 
-    # ---- Map Office from Team sheet (authoritative) ----
     team_df = load_team_df()
     df = df.merge(team_df, how="left", left_on="Team Member", right_on="Member")
-    df.drop(columns=["Member"], inplace=True, errors="ignore")  # keep 'Office' from team_df
+    df.drop(columns=["Member"], inplace=True, errors="ignore")  # keep Office
     return df
 
 # ---------- GOV.UK bank holidays (England & Wales only) ----------
@@ -149,7 +147,6 @@ def load_bank_holidays() -> set[pd.Timestamp]:
     gov = set(gov_idx.to_pydatetime())
     if not BANK_URL_EDIT:
         return {pd.Timestamp(d) for d in gov}
-    # Optional extra dates from a sheet tab (e.g., company days)
     url = to_csv_export_url(BANK_URL_EDIT)
     df = read_csv(url)
     if df.empty:
@@ -259,15 +256,11 @@ if office_choice != "Whole Team":
 else:
     roster = team_df
 
-# Final member list (always from Team sheet)
 members = roster["Member"].tolist()
-
-# Fast lookups
 days_lookup = {(r["Member"], r["Date"]): r for _, r in df_days.iterrows()}
 office_lookup = dict(zip(team_df["Member"], team_df["Office"]))
 
 # ================= RENDER TABLE =================
-# header
 head = ["<th style='min-width:260px;text-align:left'>Member</th>"] + [
     f"<th style='padding:6px 4px; width:28px; background:{WEEKEND if (d.weekday()>=5 or is_bank_holiday(d)) else '#fff'}'>{d.day}</th>"
     for d in dates
@@ -314,3 +307,64 @@ st.markdown(
     """,
     unsafe_allow_html=True
 )
+
+# ================= CANCEL A REQUEST (UI + optional backend call) =================
+st.markdown("---")
+st.markdown("### Cancel a request")
+
+# Annual Leave blocks directly from Requests (not exploded)
+if "Type" in df_req.columns:
+    df_al = df_req[df_req["Type"] == "Annual Leave"].copy()
+else:
+    df_al = pd.DataFrame(columns=df_req.columns)
+
+def _label_for_row(r):
+    f = pd.to_datetime(r["From (Date)"], dayfirst=True, errors="coerce")
+    u = pd.to_datetime(r["Until (Date)"], dayfirst=True, errors="coerce")
+    fs = f.strftime("%d %b %Y") if pd.notna(f) else str(r["From (Date)"])
+    us = u.strftime("%d %b %Y") if pd.notna(u) else str(r["Until (Date)"])
+    return f'{r["Team Member"]} — {fs} → {us}'
+
+members_all = team_df["Member"].tolist()
+m_selected = st.selectbox("Team Member", members_all, key="cancel_member_select")
+
+sub = df_al[df_al["Team Member"].str.lower() == m_selected.lower()].copy()
+# (Optional) limit to selected year:
+# sub = sub[(sub["From (Date)"].dt.year == year) | (sub["Until (Date)"].dt.year == year)]
+
+options = []
+for _, r in sub.iterrows():
+    options.append((
+        _label_for_row(r),
+        {
+            "member": r["Team Member"],
+            "type": "Annual Leave",
+            "from": pd.to_datetime(r["From (Date)"], dayfirst=True, errors="coerce").strftime("%d/%m/%Y"),
+            "until": pd.to_datetime(r["Until (Date)"], dayfirst=True, errors="coerce").strftime("%d/%m/%Y"),
+        }
+    ))
+
+if not options:
+    st.info("No Annual Leave requests found for that person.")
+else:
+    labels = [o[0] for o in options]
+    choice = st.selectbox("Select request", labels, key="cancel_request_select")
+    chosen_payload = dict(options[labels.index(choice)][1]) if choice else None
+
+    with st.expander("Show cancellation payload (preview)"):
+        st.json(chosen_payload)
+
+    if st.button("Cancel selected request", type="primary", use_container_width=True, key="cancel_button"):
+        if not CANCELLATION_ENDPOINT or not CANCEL_TOKEN:
+            st.warning("Looks good! To actually cancel, set CANCELLATION_ENDPOINT and CANCEL_TOKEN at the top of app.py.")
+        else:
+            try:
+                payload = {**chosen_payload, "token": CANCEL_TOKEN}
+                resp = requests.post(CANCELLATION_ENDPOINT, json=payload, timeout=10)
+                ok = resp.ok and resp.headers.get("content-type","").startswith("application/json") and resp.json().get("ok")
+                if ok:
+                    st.success("Request cancelled. Refresh the page to update the board.")
+                else:
+                    st.error(f"Cancellation failed: {resp.text}")
+            except Exception as e:
+                st.error(f"Error contacting cancellation service: {e}")
