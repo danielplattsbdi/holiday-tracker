@@ -10,7 +10,7 @@ TEAM_URL_EDIT     = "https://docs.google.com/spreadsheets/d/1Ho_xH8iESP0HVTeXKFe
 # OPTIONAL: Bank holidays tab (add a tab with a single column 'Date')
 BANK_URL_EDIT     = ""  # set in Streamlit Secrets if you create it
 
-# (optional) override via Streamlit Secrets (kept as-is)
+# (optional) override via Streamlit Secrets (kept, but not required)
 REQUESTS_URL_EDIT = st.secrets.get("SHEET_URL_REQUESTS", REQUESTS_URL_EDIT)
 TEAM_URL_EDIT     = st.secrets.get("SHEET_URL_TEAM", TEAM_URL_EDIT)
 BANK_URL_EDIT     = st.secrets.get("SHEET_URL_BANKHOLIDAYS", BANK_URL_EDIT)
@@ -18,12 +18,14 @@ BANK_URL_EDIT     = st.secrets.get("SHEET_URL_BANKHOLIDAYS", BANK_URL_EDIT)
 LOGO_URL = "https://sitescdn.wearevennture.co.uk/public/bdi-resourcing/site/live/uploads/brandmark.png"
 
 # Brand / palette
-PRIMARY  = "#a31fea"   # Annual Leave
-SICK     = "#1feabf"   # Sickness
+PRIMARY  = "#a31fea"   # Annual Leave (brand purple)
+SICK     = "#e6d4fa"   # Sickness (pale tint of brand purple)
 WEEKEND  = "#f7f8fb"
 MUTED    = "#636672"
 INK      = "#25262b"
 GRID     = "#e5e6eb"
+DARK_HDR = "#1b1b1b"
+
 TYPE_COLORS = {"Annual Leave": PRIMARY, "Sickness": SICK}
 TYPE_LABELS = {"Annual Leave": "AL", "Sickness": "S"}
 ALLOWANCE = 25
@@ -110,24 +112,16 @@ ENG_WALES_KEY = "england-and-wales"
 def fetch_govuk_bank_holidays_eng() -> pd.DatetimeIndex:
     """
     Fetch England & Wales bank holidays from GOV.UK JSON feed.
-    Returns a normalized DatetimeIndex (no .dt used anywhere).
+    Returns a normalized DatetimeIndex (no .dt used anywhere). Silent on UI.
     """
     try:
         r = requests.get("https://www.gov.uk/bank-holidays.json", timeout=10)
         r.raise_for_status()
         data = r.json()
         events = data.get(ENG_WALES_KEY, {}).get("events", [])
-        # DatetimeIndex (not Series), then normalize without .dt
         idx = pd.to_datetime([e["date"] for e in events], errors="coerce")
-        idx = idx.dropna().normalize()
-        # Tiny informational chip so you can see it worked
-        if len(idx) > 0:
-            st.info(f"GOV.UK bank holidays loaded: {len(idx)} dates (E&W)")
-        else:
-            st.warning("GOV.UK bank holidays returned no dates")
-        return idx
-    except Exception as e:
-        st.warning(f"GOV.UK bank holiday fetch failed: {e}")
+        return idx.dropna().normalize()
+    except Exception:
         return pd.DatetimeIndex([])
 
 @st.cache_data(ttl=300)
@@ -171,29 +165,34 @@ def explode_days(df: pd.DataFrame) -> pd.DataFrame:
 # ================= UI HEADER & LAYOUT =================
 st.set_page_config(page_title="BDI Holiday & Sickness", layout="wide")
 
-# Centered container & tighter spacing
-st.markdown("""
+# Global CSS (header + table polish)
+st.markdown(f"""
 <style>
-  .main > div {max-width: 1100px; margin-left: auto; margin-right: auto;}
-  table {border-collapse:collapse; font-family:system-ui, -apple-system, Segoe UI, Roboto; font-size:12px;}
-  th,td {border:1px solid """+GRID+"""; padding:3px 6px;}
-  th {background:#fafafa; font-weight:700; position:sticky; top:0; z-index:2;}
-  td:first-child, th:first-child {position:sticky; left:0; background:#fff; z-index:3;}
-  .namecell {font-weight:600; text-align:left;}
-  .daysleft {color:"""+MUTED+"""; font-size:11px;}
-  .pill {display:inline-block; padding:2px 6px; border:1px solid """+GRID+"""; border-radius:999px; font-size:11px; color:"""+MUTED+""";}
+  .main > div {{max-width: 1100px; margin-left: auto; margin-right: auto;}}
+  .bdi-header {{
+    background:{DARK_HDR}; border-radius:12px; padding:12px 16px;
+    display:flex; align-items:center; gap:14px; margin-bottom:12px;
+  }}
+  .bdi-title {{ color:#fff; font:700 16px/1.2 system-ui, -apple-system, Segoe UI, Roboto; }}
+  table {{ border-collapse:collapse; font-family:system-ui, -apple-system, Segoe UI, Roboto; font-size:12px; }}
+  th,td {{ border:1px solid {GRID}; padding:3px 6px; }}
+  th {{ background:#fafafa; font-weight:700; position:sticky; top:0; z-index:2; }}
+  td:first-child, th:first-child {{ position:sticky; left:0; background:#fff; z-index:3; }}
+  .namecell {{ font-weight:600; text-align:left; }}
+  .daysleft {{ color:{MUTED}; font-size:11px; }}
 </style>
 """, unsafe_allow_html=True)
 
-col_logo, col_title = st.columns([1,4])
-with col_logo:
-    st.markdown(
-        f'<img src="{LOGO_URL}" style="width:100%;max-height:60px;object-fit:contain;">',
-        unsafe_allow_html=True
-    )
-with col_title:
-    st.markdown("## **BDI Holiday & Sickness Tracker**")
-    st.caption("Reach. Recruit. Relocate.")
+# Brand header
+st.markdown(
+    f"""
+    <div class="bdi-header">
+      <img src="{LOGO_URL}" style="height:36px;object-fit:contain">
+      <div class="bdi-title">BDI Holiday &amp; Sickness Tracker</div>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
 
 # ================= DATA & CONTROLS =================
 df_req = load_requests()
@@ -209,22 +208,11 @@ else:
     year_max = int(max(df_req["From (Date)"].dt.year.max(), df_req["Until (Date)"].dt.year.max(), now.year)) + 1
 
 years = list(range(year_min, year_max + 1))
-c1, c2, c3 = st.columns([1,1,3])
+c1, c2 = st.columns([1,1])
 with c1:
     year = st.selectbox("Year", years, index=years.index(now.year) if now.year in years else 0)
 with c2:
     month = st.selectbox("Month", list(calendar.month_name)[1:], index=now.month-1)
-with c3:
-    # tiny debug chip showing holidays loaded for this month
-    month_index = list(calendar.month_name).index(month)
-    start = pd.Timestamp(dt.date(year, month_index, 1))
-    end = start + pd.offsets.MonthEnd(1)
-    bh_in_month = sorted([d for d in bank_holidays if start <= d <= end])
-    st.markdown(
-        f"<span class='pill'>BH loaded for {calendar.month_name[month_index]}: "
-        f"{', '.join(pd.to_datetime(d).strftime('%d %b') for d in bh_in_month) if bh_in_month else 'none'}</span>",
-        unsafe_allow_html=True
-    )
 
 df_days = explode_days(df_req)
 
@@ -234,15 +222,13 @@ def is_bank_holiday(ts: pd.Timestamp) -> bool:
 
 def is_working_day(ts: pd.Timestamp) -> bool:
     """Mon–Fri and not a bank holiday."""
-    if ts.weekday() >= 5:
-        return False
-    if is_bank_holiday(ts):
-        return False
+    if ts.weekday() >= 5: return False
+    if is_bank_holiday(ts): return False
     return True
 
-def remaining_for(member: str, yr: int) -> int | float:
+def remaining_for(member: str, yr: int) -> float:
     """25 minus AL days in that calendar year, excluding weekends/bank holidays."""
-    if df_days.empty: return ALLOWANCE
+    if df_days.empty: return float(ALLOWANCE)
     mask = (
         (df_days["Member"] == member) &
         (df_days["Type"] == "Annual Leave") &
@@ -250,9 +236,10 @@ def remaining_for(member: str, yr: int) -> int | float:
     )
     days = df_days.loc[mask, "Date"]
     used = sum(1 for d in days if is_working_day(pd.Timestamp(d)))
-    return ALLOWANCE - used
+    return float(ALLOWANCE) - used
 
 # Month dates
+month_index = list(calendar.month_name).index(month)
 num_days = calendar.monthrange(year, month_index)[1]
 dates = pd.date_range(dt.date(year, month_index, 1), periods=num_days)
 today = pd.Timestamp.now().normalize()
@@ -269,7 +256,7 @@ rows = []
 for m in team_members:
     rem = remaining_for(m, year)
     row = [f"<td class='namecell'>{html.escape(m)}"
-           f"<div class='daysleft'>{rem} days left</div></td>"]
+           f"<div class='daysleft'>{rem:.0f} days left</div></td>"]
     # member's records for month (speed-up lookup)
     md = df_days[df_days["Member"]==m]
     for d in dates:
@@ -282,8 +269,12 @@ for m in team_members:
         if not rec.empty and (d.weekday() < 5 and not is_bh):  # paint only Mon–Fri and not bank holidays
             t = rec.iloc[0]["Type"]
             color = TYPE_COLORS.get(t, PRIMARY)
+            # Dark text for pale sickness, white for AL
+            text_color = INK if t == "Sickness" else "#fff"
             label = TYPE_LABELS.get(t, "")
-            row.append(f"<td style='background:{color};color:#fff;text-align:center;width:28px'>{label}</td>")
+            row.append(
+                f"<td style='background:{color};color:{text_color};text-align:center;width:28px'>{label}</td>"
+            )
         else:
             row.append(f"<td style='background:{bg};border:1px solid {border};width:28px'></td>")
     rows.append("<tr>" + "".join(row) + "</tr>")
@@ -297,13 +288,13 @@ html_table = f"""
 
 st.markdown(html_table, unsafe_allow_html=True)
 
-# Legend
+# Legend (updated colour)
 st.markdown(
     f"""
     <div style='margin-top:10px;'>
       <b>Legend:</b>
       <span style='background:{PRIMARY};color:#fff;padding:2px 6px;border-radius:4px;'>AL</span> Annual Leave &nbsp;
-      <span style='background:{SICK};color:#fff;padding:2px 6px;border-radius:4px;'>S</span> Sickness &nbsp;
+      <span style='background:{SICK};color:{INK};padding:2px 6px;border-radius:4px;'>S</span> Sickness &nbsp;
       <span style='display:inline-block;width:18px;height:14px;background:{WEEKEND};border:1px solid {GRID};border-radius:3px;vertical-align:middle'></span>
       Weekend / Bank holiday
     </div>
