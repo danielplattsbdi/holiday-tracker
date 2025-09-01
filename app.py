@@ -1,8 +1,11 @@
+# app.py
 import pandas as pd
 import streamlit as st
 import calendar, datetime as dt, html, re, requests
 
-# ================= CONFIG =================
+# ==============================
+# ======= CONFIG / BRAND =======
+# ==============================
 REQUESTS_URL_EDIT = "https://docs.google.com/spreadsheets/d/1Ho_xH8iESP0HVTeXKFe2gyWOg18kcMFKrLvEi2wNyMs/edit?gid=231607063"   # Requests
 TEAM_URL_EDIT     = "https://docs.google.com/spreadsheets/d/1Ho_xH8iESP0HVTeXKFe2gyWOg18kcMFKrLvEi2wNyMs/edit?gid=1533771603"  # Team
 
@@ -28,10 +31,12 @@ SHADOW    = "0 10px 30px rgba(16,17,20,.06), 0 2px 8px rgba(16,17,20,.06)"
 
 TYPE_COLORS  = {"Annual Leave": PRIMARY, "Sickness": SICK}
 TYPE_LABELS  = {"Annual Leave": "AL", "Sickness": "S"}
-ALLOWANCE    = 25
+ALLOWANCE_DEFAULT = 25
 ENG_WALES_KEY = "england-and-wales"
 
-# ================= HELPERS =================
+# ==============================
+# =========== HELPERS ==========
+# ==============================
 def to_csv_export_url(edit_url: str) -> str:
     if "/edit?gid=" in edit_url:
         return edit_url.replace("/edit?gid=", "/export?format=csv&gid=")
@@ -40,19 +45,68 @@ def to_csv_export_url(edit_url: str) -> str:
     return edit_url.replace("/edit", "/export?format=csv")
 
 def _smart_date(val):
-    if pd.isna(val): return pd.NaT
+    """Robust UK-first parser: dd/mm/yyyy wins; then ISO; then dayfirst; then serial."""
+    if pd.isna(val): 
+        return pd.NaT
     s = str(val).strip()
-    # ISO or text
-    d = pd.to_datetime(s, errors="coerce")
-    if pd.notna(d): return d
-    # UK style
-    d = pd.to_datetime(s, dayfirst=True, errors="coerce")
-    if pd.notna(d): return d
-    # Excel serial
+
+    # UK dd/mm/yyyy
+    if re.match(r"^\d{1,2}/\d{1,2}/\d{4}$", s):
+        try:
+            dd, mm, yyyy = map(int, s.split("/"))
+            return pd.Timestamp(year=yyyy, month=mm, day=dd)
+        except Exception:
+            pass
+
+    # ISO yyyy-mm-dd
+    if re.match(r"^\d{4}-\d{2}-\d{2}", s):
+        d = pd.to_datetime(s, errors="coerce", utc=False)
+        if pd.notna(d): 
+            return d
+
+    # General parse (UK preference)
+    d = pd.to_datetime(s, dayfirst=True, errors="coerce", utc=False)
+    if pd.notna(d):
+        return d
+
+    # Excel serials
     n = pd.to_numeric(s, errors="coerce")
     if pd.notna(n):
         return pd.to_datetime(n, unit="d", origin="1899-12-30", errors="coerce")
+
     return pd.NaT
+
+def _parse_time_str(s: str):
+    """Return a time() if we can parse; else None."""
+    if pd.isna(s): 
+        return None
+    s = str(s).strip()
+    if not s:
+        return None
+    # Common text shorthands won't parse to time; handle later via hints.
+    try:
+        t = pd.to_datetime(s, errors="coerce").time()
+        return t
+    except Exception:
+        return None
+
+def _half_hint(s: str):
+    """Return 'am'/'pm' if the free text clearly indicates half-day."""
+    if pd.isna(s): 
+        return None
+    s = str(s).strip().lower()
+    # Be careful: '12:00pm' contains 'pm' but is a time; we only hit this if parse failed.
+    if re.search(r"\b(am|morning|a\.m\.|half day am|half-day am|am half)\b", s):
+        return "am"
+    if re.search(r"\b(pm|afternoon|p\.m\.|half day pm|half-day pm|pm half)\b", s):
+        return "pm"
+    return None
+
+def hex_to_rgba(hex_color: str, alpha: float) -> str:
+    """Convert #rrggbb to rgba(r,g,b,a)."""
+    h = hex_color.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f"rgba({r},{g},{b},{alpha})"
 
 @st.cache_data(ttl=60)
 def read_csv(url: str) -> pd.DataFrame:
@@ -66,23 +120,36 @@ def load_team() -> pd.DataFrame:
     url = to_csv_export_url(TEAM_URL_EDIT)
     raw = read_csv(url).copy().rename(columns=lambda c: str(c).strip())
     if raw.empty:
-        return pd.DataFrame(columns=["Team Member","Office"])
+        return pd.DataFrame(columns=["Team Member","Office","Allowance"])
     out = raw.copy()
+
+    # Team Member
     if "Team Member" not in out.columns:
         for alt in ["Name","Full Name","Member"]:
             if alt in out.columns:
                 out["Team Member"] = out[alt]
                 break
     out["Team Member"] = out["Team Member"].astype(str).map(lambda s: re.sub(r"\s+"," ",s).strip())
+
+    # Office
     if "Office" not in out.columns:
         out["Office"] = "Unassigned"
     out["Office"] = out["Office"].fillna("Unassigned").astype(str).map(lambda s: s.strip().title())
+
+    # Optional per-person Allowance override
+    if "Allowance" in out.columns:
+        out["Allowance"] = pd.to_numeric(out["Allowance"], errors="coerce").fillna(ALLOWANCE_DEFAULT)
+    else:
+        out["Allowance"] = ALLOWANCE_DEFAULT
+
+    # Filter to active if an 'Active' style column exists
     for cand in ["Active","Is Active","Enabled"]:
         if cand in out.columns:
             mask = out[cand].astype(str).str.strip().str.lower().isin(["1","true","yes","y"])
             out = out[mask]
             break
-    return (out[["Team Member","Office"]]
+
+    return (out[["Team Member","Office","Allowance"]]
             .dropna(subset=["Team Member"])
             .drop_duplicates("Team Member")
             .sort_values("Team Member")
@@ -96,20 +163,30 @@ def load_requests() -> pd.DataFrame:
         return df
     df = df.rename(columns=lambda c: str(c).strip())
 
-    for c in ["Team Member","Type","From (Date)","Until (Date)","Start Time","End Time","Office","Line Manager","Notes"]:
-        if c not in df.columns: df[c] = None
+    # Ensure expected columns
+    for c in ["Team Member","Type","From (Date)","Until (Date)","Start Time","End Time",
+              "Office","Line Manager","Notes","Status"]:
+        if c not in df.columns: 
+            df[c] = None
 
+    # Clean + parse
     df["Team Member"]  = df["Team Member"].astype(str).map(lambda s: re.sub(r"\s+"," ",s).strip())
     df["From (Date)"]  = df["From (Date)"].map(_smart_date)
     df["Until (Date)"] = df["Until (Date)"].map(_smart_date)
 
+    # Normalise type (defensive)
     def norm_type(x):
         s = str(x).strip().lower()
         if "sick" in s: return "Sickness"
-        if any(k in s for k in ["annual","holiday","leave"]): return "Annual Leave"
-        return str(x)
+        if any(k in s for k in ["annual","holiday","leave","al"]): return "Annual Leave"
+        return str(x).strip() if x is not None else ""
     df["Type"] = df["Type"].map(norm_type)
 
+    # Normalise Status and default to Pending if blank
+    df["Status"] = df["Status"].fillna("").astype(str).str.strip().str.title()
+    df.loc[df["Status"]=="", "Status"] = "Pending"
+
+    # Valid rows only
     df = df.dropna(subset=["Team Member","Type","From (Date)","Until (Date)"])
     df = df[df["Until (Date)"] >= df["From (Date)"]]
     return df
@@ -125,15 +202,76 @@ def fetch_govuk_bank_holidays_eng() -> set[pd.Timestamp]:
     except Exception:
         return set()
 
+def classify_half_for_date(row, date_ts: pd.Timestamp):
+    """
+    Determine if a given 'date_ts' within a booking row is full, morning half ('am') or afternoon half ('pm').
+    Uses Start/End Time and free-text hints. Only single-day or first/last day of a span can be half-days.
+    """
+    from_d = row["From (Date)"].normalize()
+    until_d = row["Until (Date)"].normalize()
+    st_raw, en_raw = row.get("Start Time", None), row.get("End Time", None)
+
+    # Try proper time parsing first
+    st_t, en_t = _parse_time_str(st_raw), _parse_time_str(en_raw)
+    # Then text hints if times weren't clear
+    st_hint, en_hint = _half_hint(st_raw), _half_hint(en_raw)
+
+    NOON = dt.time(12, 0)
+    ONE_PM = dt.time(13, 0)
+
+    def am_half_by_time():
+        # Morning half if we only cover morning; end by ~1pm or explicit hint
+        if en_t and (en_t <= ONE_PM):
+            return True
+        if st_hint == "am" or en_hint == "am":
+            return True
+        return False
+
+    def pm_half_by_time():
+        # Afternoon half if we start around/after noon
+        if st_t and (st_t >= NOON):
+            return True
+        if st_hint == "pm" or en_hint == "pm":
+            return True
+        return False
+
+    # Single-day booking
+    if from_d == until_d == date_ts.normalize():
+        if am_half_by_time() and not pm_half_by_time():
+            return "am"
+        if pm_half_by_time() and not am_half_by_time():
+            return "pm"
+        return None  # full day
+
+    # Multi-day: only the edges can be half
+    if date_ts.normalize() == from_d:
+        if pm_half_by_time():
+            return "pm"
+    if date_ts.normalize() == until_d:
+        if am_half_by_time():
+            return "am"
+    return None
+
 def explode_days(df: pd.DataFrame) -> pd.DataFrame:
+    """Per-day rows with fraction + half indicator + status."""
     if df.empty:
-        return pd.DataFrame(columns=["Member","Date","Type"])
+        return pd.DataFrame(columns=["Member","Date","Type","Status","Frac","Half"])
     out=[]
     for _, r in df.iterrows():
         cur = r["From (Date)"].date()
         end = r["Until (Date)"].date()
         while cur <= end:
-            out.append({"Member": r["Team Member"], "Date": pd.Timestamp(cur), "Type": r["Type"]})
+            ts = pd.Timestamp(cur)
+            half = classify_half_for_date(r, ts)
+            frac = 0.5 if half in ("am","pm") else 1.0
+            out.append({
+                "Member": r["Team Member"],
+                "Date": ts,
+                "Type": r["Type"],
+                "Status": r["Status"],
+                "Frac": frac,
+                "Half": half
+            })
             cur += dt.timedelta(days=1)
     return pd.DataFrame(out)
 
@@ -142,23 +280,10 @@ def fmt_days(x):
         return int(x) if float(x).is_integer() else round(float(x), 1)
     return x
 
-# ================= UI (header + layout) =================
+# ==============================
+# ============ UI ==============
+# ==============================
 st.set_page_config(page_title="BDI Holiday & Sickness", layout="wide")
-
-# Branded header card
-st.markdown(
-    f"""
-    <div style="
-      background:{HEADER_BG}; border-radius:16px; padding:14px 16px;
-      display:flex; align-items:center; gap:14px; margin:8px auto 14px; max-width:1120px;
-      box-shadow:{SHADOW};
-    ">
-      <img src="{LOGO_URL}" style="height:36px;object-fit:contain">
-      <div style="color:#fff; font:700 18px system-ui">BDI Holiday &amp; Sickness Tracker</div>
-    </div>
-    """,
-    unsafe_allow_html=True
-)
 
 # Global CSS
 st.markdown(
@@ -185,26 +310,54 @@ st.markdown(
         box-shadow:0 1px 2px rgba(0,0,0,.04);
       }}
       .legend-swatch {{ width:18px; height:12px; border-radius:4px; border:1px solid {GRID}; display:inline-block; }}
+      .bdi-btn {{
+        display:inline-block; padding:8px 12px; border-radius:10px; border:1px solid {GRID};
+        font-weight:600; text-decoration:none; background:#fff;
+      }}
+      .bdi-btn:hover {{ filter:brightness(0.98); }}
     </style>
     """,
     unsafe_allow_html=True
 )
 
-# ================= DATA =================
+# Branded header card
+st.markdown(
+    f"""
+    <div style="
+      background:{HEADER_BG}; border-radius:16px; padding:14px 16px;
+      display:flex; align-items:center; justify-content:space-between; gap:14px; margin:8px auto 14px; max-width:1120px;
+      box-shadow:{SHADOW};
+    ">
+      <div style="display:flex; align-items:center; gap:14px;">
+        <img src="{LOGO_URL}" style="height:36px;object-fit:contain">
+        <div style="color:#fff; font:700 18px system-ui">BDI Holiday &amp; Sickness Tracker</div>
+      </div>
+      <a class="bdi-btn" href="{BOOKING_FORM_URL}" target="_blank" rel="noopener">+ New Booking</a>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
+
+# ==============================
+# ============ DATA ============
+# ==============================
 df_req   = load_requests()
 df_team  = load_team()
-df_days  = explode_days(df_req)
 bank_holidays = fetch_govuk_bank_holidays_eng()
 
 team_members = sorted(df_team["Team Member"].unique().tolist()) if not df_team.empty else []
 
-# ================= CONTROLS =================
+# ==============================
+# ========= CONTROLS ===========
+# ==============================
 now = dt.datetime.now()
 years = list(range(now.year-1, now.year+2))
 offices = ["Whole Team"] + sorted(df_team["Office"].unique()) if not df_team.empty else ["Whole Team"]
 
 with st.container():
-    c1, c2, c3 = st.columns([1,1,2])
+    c0, c1, c2, c3 = st.columns([1,1,1,2])
+    with c0:
+        show_pending = st.toggle("Show pending", value=True, help="Include Pending items in the grid (shown translucent with dashed outline)")
     with c1:
         year = st.selectbox("Year", years, index=years.index(now.year))
     with c2:
@@ -212,19 +365,20 @@ with st.container():
     with c3:
         office = st.selectbox("Office", offices)
 
-# Book AL button (top-right above grid)
-st.markdown(
-    f"""
-    <div style="display:flex; justify-content:flex-end; margin:6px 0 12px;">
-      <a href="{BOOKING_FORM_URL}"
-         target="_blank"
-         style="background:{PRIMARY}; color:white; font-weight:600; padding:8px 16px; border-radius:8px; text-decoration:none; font-size:14px;">
-        ➕ Book Annual Leave
-      </a>
-    </div>
-    """,
-    unsafe_allow_html=True
-)
+# Filter Requests for view
+if df_req.empty:
+    df_req_view = df_req.copy()
+    df_req_approved = df_req.copy()
+else:
+    df_req_approved = df_req[df_req["Status"] == "Approved"].copy()
+    if not show_pending:
+        df_req_view = df_req_approved.copy()
+    else:
+        df_req_view = df_req[df_req["Status"].isin(["Approved","Pending"])].copy()
+
+# Derived per-day frames
+df_days_view     = explode_days(df_req_view)
+df_days_approved = explode_days(df_req_approved)
 
 # Month index + helpers
 month_index = list(calendar.month_name).index(month)
@@ -234,16 +388,37 @@ today = pd.Timestamp.now().normalize()
 def is_bank_holiday(ts): return ts.normalize() in bank_holidays
 def is_working_day(ts): return ts.weekday()<5 and not is_bank_holiday(ts)
 
-def remaining_for(member, yr):
-    if df_days.empty: return ALLOWANCE
-    mask = ((df_days["Member"]==member) & (df_days["Type"]=="Annual Leave") & (df_days["Date"].dt.year==yr))
-    days = df_days.loc[mask, "Date"]
-    used = sum(1 for d in days if is_working_day(pd.Timestamp(d)))
-    return ALLOWANCE - used
+def allowance_for(member, yr):
+    # Per-person override if present
+    if df_team.empty:
+        base = ALLOWANCE_DEFAULT
+    else:
+        row = df_team[df_team["Team Member"] == member]
+        base = (row["Allowance"].iloc[0] if not row.empty else ALLOWANCE_DEFAULT)
 
-# ================= GRID =================
+    if df_days_approved.empty:
+        return base
+
+    mask = ((df_days_approved["Member"]==member)
+            & (df_days_approved["Type"]=="Annual Leave")
+            & (df_days_approved["Date"].dt.year==yr))
+    sub = df_days_approved.loc[mask]
+    used = sum((r.Frac if is_working_day(pd.Timestamp(r.Date)) else 0.0) for r in sub.itertuples())
+    return base - used
+
+# ==============================
+# ============ GRID ============
+# ==============================
 with st.container():
     st.markdown("<div class='bdi-card'>", unsafe_allow_html=True)
+
+    # badge showing current scope
+    scope_txt = "Approved only" if not show_pending else "Approved + Pending"
+    st.markdown(
+        f"<div style='margin:0 0 8px 0;color:{MUTED};font:12px system-ui'>Viewing: "
+        f"<span class='badge' style='background:#fff'>{scope_txt}</span></div>",
+        unsafe_allow_html=True
+    )
 
     head_cells = ["<th style='min-width:260px;text-align:left'>Team member</th>"] + [
         f"<th style='padding:6px 4px; width:28px; background:{WEEKEND if (d.weekday()>=5 or is_bank_holiday(d)) else '#fff'}'>{d.day}</th>"
@@ -251,47 +426,110 @@ with st.container():
     ]
 
     rows=[]
-    render_team = df_team if office == "Whole Team" else df_team[df_team["Office"]==office]
+    render_team = df_team if (office == "Whole Team" or df_team.empty) else df_team[df_team["Office"]==office]
+
+    # Priority if ever overlapping types (sickness over AL)
+    type_priority = {"Sickness": 2, "Annual Leave": 1}
+
     for _, r in render_team.iterrows():
         m = r["Team Member"]
-        rem = remaining_for(m, year)
+        rem = allowance_for(m, year)
         rem_txt = fmt_days(rem)
         name_html = (
             f"<div>{html.escape(m)}<span class='badge'>{html.escape(r['Office'])}</span></div>"
             f"<div class='daysleft'>{rem_txt} days left</div>"
         )
         row=[f"<td class='namecell'>{name_html}</td>"]
-        md = df_days[df_days["Member"]==m]
+        md = df_days_view[df_days_view["Member"]==m]
+
         for d in dates:
             is_bh = is_bank_holiday(d)
             bg = WEEKEND if (d.weekday()>=5 or is_bh) else "#fff"
-            border = f"2px dashed {MUTED}" if d==today else GRID
-            rec = md[md["Date"]==d]
-            if not rec.empty and (d.weekday()<5 and not is_bh):
-                t=rec.iloc[0]["Type"]
-                color=TYPE_COLORS.get(t,PRIMARY)
-                label=TYPE_LABELS.get(t,"")
-                txt = "#000" if t=="Sickness" else "#fff"
-                row.append(f"<td style='background:{color};color:{txt};text-align:center;width:28px;font-weight:800'>{label}</td>")
+            # Full CSS border string (fix 'today' highlight)
+            border_css = f"2px dashed {MUTED}" if d==today else f"1px solid {GRID}"
+
+            recs = md[md["Date"]==d]
+            if not recs.empty and (d.weekday()<5 and not is_bh):
+                # choose best by priority
+                recs = recs.copy()
+                recs["prio"] = recs["Type"].map(lambda t: type_priority.get(t, 0))
+                rec = recs.sort_values("prio", ascending=False).iloc[0]
+                t = rec["Type"]
+                status = rec["Status"]  # "Approved" or "Pending"
+                half = rec["Half"]      # None / "am" / "pm"
+
+                color = TYPE_COLORS.get(t, PRIMARY)
+                label = TYPE_LABELS.get(t,"")
+                # Text colour: white for AL approved; black otherwise
+                txt = "#fff" if (t=="Annual Leave" and status=="Approved" and (half is None)) else "#000"
+
+                # Pending visuals
+                if status == "Pending":
+                    rgba = hex_to_rgba(color, 0.18)
+                    if half == "am":
+                        bg_style = f"linear-gradient(135deg, {rgba} 0 50%, #fff 50% 100%)"
+                    elif half == "pm":
+                        bg_style = f"linear-gradient(135deg, #fff 0 50%, {rgba} 50% 100%)"
+                    else:
+                        bg_style = rgba
+                    row.append(
+                        f"<td style='background:{bg_style};border:2px dashed {color};width:28px;text-align:center;font-weight:800'>{label}</td>"
+                    )
+                else:
+                    # Approved visuals
+                    if half == "am":
+                        bg_style = f"linear-gradient(135deg, {color} 0 50%, #fff 50% 100%)"
+                        row.append(
+                            f"<td style='background:{bg_style};border:{border_css};width:28px;text-align:center;font-weight:800;color:#000'>{label}</td>"
+                        )
+                    elif half == "pm":
+                        bg_style = f"linear-gradient(135deg, #fff 0 50%, {color} 50% 100%)"
+                        row.append(
+                            f"<td style='background:{bg_style};border:{border_css};width:28px;text-align:center;font-weight:800;color:#000'>{label}</td>"
+                        )
+                    else:
+                        row.append(
+                            f"<td style='background:{color};color:{txt};text-align:center;width:28px;font-weight:800;border:{border_css}'>{label}</td>"
+                        )
             else:
-                row.append(f"<td style='background:{bg};border:1px solid {border};width:28px'></td>")
+                row.append(f"<td style='background:{bg};border:{border_css};width:28px'></td>")
         rows.append("<tr>"+"".join(row)+"</tr>")
 
     table_html = f"""
     <table>
       <thead><tr>{''.join(head_cells)}</tr></thead>
-      <tbody>{''.join(rows)}</tbody>
+      <tbody>{''.join(rows) if rows else ''}</tbody>
     </table>
     """
     st.markdown(table_html, unsafe_allow_html=True)
 
     # Legend
+    pend_al_rgba = hex_to_rgba(PRIMARY, 0.18)
+    pend_s_rgba  = hex_to_rgba(SICK, 0.18)
     st.markdown(
         f"""
-        <div style="margin-top:10px; display:flex; gap:8px; flex-wrap:wrap;">
-          <span class="legend-chip"><i class="legend-swatch" style="background:{PRIMARY}"></i>Annual Leave</span>
-          <span class="legend-chip"><i class="legend-swatch" style="background:{SICK}"></i>Sickness</span>
-          <span class="legend-chip"><i class="legend-swatch" style="background:{WEEKEND}"></i>Weekend / Bank Holiday</span>
+        <div style="margin-top:10px; display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+          <span class="legend-chip">
+            <i class="legend-swatch" style="background:{PRIMARY}"></i>Annual Leave (AL)
+          </span>
+          <span class="legend-chip">
+            <i class="legend-swatch" style="background:{SICK}"></i>Sickness (S)
+          </span>
+          <span class="legend-chip">
+            <i class="legend-swatch" style="background:{pend_al_rgba}; border:2px dashed {PRIMARY}"></i>Pending (AL)
+          </span>
+          <span class="legend-chip">
+            <i class="legend-swatch" style="background:{pend_s_rgba}; border:2px dashed {SICK}"></i>Pending (S)
+          </span>
+          <span class="legend-chip">
+            <i class="legend-swatch" style="background:linear-gradient(135deg, {PRIMARY} 0 50%, #fff 50% 100%);"></i>Half-day AM
+          </span>
+          <span class="legend-chip">
+            <i class="legend-swatch" style="background:linear-gradient(135deg, #fff 0 50%, {PRIMARY} 50% 100%);"></i>Half-day PM
+          </span>
+          <span class="legend-chip">
+            <i class="legend-swatch" style="background:{WEEKEND}"></i>Weekend / Bank Holiday
+          </span>
         </div>
         """,
         unsafe_allow_html=True
@@ -299,7 +537,9 @@ with st.container():
 
     st.markdown("</div>", unsafe_allow_html=True)
 
-# ================= BULK CANCEL (checkboxes) =================
+# ==============================
+# ======= BULK CANCEL UI =======
+# ==============================
 st.markdown("### ❌ Cancel Booking(s)")
 st.caption("Select a team member, tick the booking(s) to cancel, then press **Cancel Selected**.")
 
@@ -311,6 +551,7 @@ else:
     today_norm = pd.Timestamp.now().normalize()
     member_reqs = pd.DataFrame(columns=df_req.columns)
     if not df_req.empty:
+        # Allow cancelling anything in the future; use raw df_req (not the filtered view) so Pending can be cancelled too
         member_reqs = df_req[
             (df_req["Team Member"] == sel_member) &
             (df_req["Type"] == "Annual Leave") &
@@ -321,7 +562,7 @@ else:
         st.info(f"{sel_member} has no upcoming Annual Leave bookings.")
     else:
         member_reqs["Label"] = member_reqs.apply(
-            lambda r: f"{r['From (Date)'].strftime('%d %b %Y')} → {r['Until (Date)'].strftime('%d %b %Y')}",
+            lambda r: f"{r['From (Date)'].strftime('%d %b %Y')} → {r['Until (Date)'].strftime('%d %b %Y')} ({r['Status']})",
             axis=1
         )
         labels = member_reqs["Label"].tolist()
@@ -329,7 +570,7 @@ else:
 
         if picks:
             preview = (member_reqs[member_reqs["Label"].isin(picks)]
-                       [["Type","From (Date)","Until (Date)"]]
+                       [["Type","From (Date)","Until (Date)","Status"]]
                        .rename(columns={"Type":"Type","From (Date)":"From","Until (Date)":"Until"}))
             st.dataframe(preview, use_container_width=True, hide_index=True)
 
