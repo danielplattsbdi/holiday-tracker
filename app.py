@@ -50,11 +50,9 @@ def _normalize_slashes(s: str) -> str:
 
 def _smart_date(val):
     """
-    UK-first extractor that **never** guesses US order.
-    Handles:
-      - dd/mm[/yyyy] (yyyy optional; yy -> 20yy; missing year -> current year)
-      - 'yyyy-mm-dd' (CSV/Sheets export) — we **swap** mm<->dd to honour original dd/mm intent when valid
-      - ISO yyyy-mm-dd or yyyy/mm/dd (kept if not swapped)
+    UK-first parser with no blind swapping:
+      - dd/mm/yyyy, dd/mm/yy (→ 20yy), dd/mm (→ current year)
+      - yyyy-mm-dd or yyyy/mm/dd (parsed **as ISO**)
       - Excel serials
       - Fallback: dayfirst=True
     """
@@ -66,22 +64,7 @@ def _smart_date(val):
 
     s_norm = _normalize_slashes(s)
 
-    # 0) If it looks like 'yyyy-mm-dd' (or with slashes), try a **safe day/month swap** first.
-    m_iso = re.match(r"^\s*(\d{4})[-/](\d{1,2})[-/](\d{1,2})\s*$", s)
-    if m_iso:
-        yyyy, mm, dd = map(int, m_iso.groups())
-        # Try swap (treat as dd/mm from an originally dd/mm/yyyy form)
-        try:
-            swapped = pd.Timestamp(year=yyyy, month=dd, day=mm)  # yyyy-dd-mm
-            return swapped
-        except Exception:
-            # If swap invalid (e.g., dd>12 but mm<=12), fall back to true ISO
-            try:
-                return pd.Timestamp(year=yyyy, month=mm, day=dd)
-            except Exception:
-                pass  # continue to other strategies
-
-    # 1) dd/mm/yyyy
+    # dd/mm/yyyy
     m = re.match(r"^\s*(\d{1,2})/(\d{1,2})/(\d{4})\s*$", s_norm)
     if m:
         dd, mm, yyyy = map(int, m.groups())
@@ -90,7 +73,7 @@ def _smart_date(val):
         except Exception:
             return pd.NaT
 
-    # 2) dd/mm/yy  -> assume 20yy
+    # dd/mm/yy
     m = re.match(r"^\s*(\d{1,2})/(\d{1,2})/(\d{2})\s*$", s_norm)
     if m:
         dd, mm, yy = map(int, m.groups())
@@ -100,7 +83,7 @@ def _smart_date(val):
         except Exception:
             return pd.NaT
 
-    # 3) dd/mm (assume current year)
+    # dd/mm  (assume current year)
     m = re.match(r"^\s*(\d{1,2})/(\d{1,2})\s*$", s_norm)
     if m:
         dd, mm = map(int, m.groups())
@@ -110,22 +93,36 @@ def _smart_date(val):
         except Exception:
             return pd.NaT
 
-    # 4) ISO-like (yyyy-mm-dd or yyyy/mm/dd) that didn't match above (rare trailing text)
-    m_iso2 = re.match(r"^\s*(\d{4})[-/](\d{2})[-/](\d{2})", s_norm)
-    if m_iso2:
-        yyyy, mm, dd = map(int, m_iso2.groups())
+    # ISO yyyy-mm-dd or yyyy/mm/dd — parse as-is
+    m = re.match(r"^\s*(\d{4})[-/](\d{1,2})[-/](\d{1,2})", s_norm)
+    if m:
+        yyyy, mm, dd = map(int, m.groups())
         try:
             return pd.Timestamp(year=yyyy, month=mm, day=dd)
         except Exception:
-            pass
+            return pd.NaT
 
-    # 5) Excel serial (numeric)
+    # Excel serial (numeric)
     n = pd.to_numeric(s, errors="coerce")
     if pd.notna(n):
         return pd.to_datetime(n, unit="d", origin="1899-12-30", errors="coerce")
 
-    # 6) Last resort: still UK
+    # Fallback: UK preference
     return pd.to_datetime(s, dayfirst=True, errors="coerce", utc=False)
+
+def _looks_iso_yyyy_mm_dd(s: str | None) -> bool:
+    if s is None or (isinstance(s, float) and pd.isna(s)): return False
+    return bool(re.match(r"^\s*\d{4}-\d{1,2}-\d{1,2}\s*$", str(s)))
+
+def _iso_swap_if_valid(ts_str: str):
+    """Return swapped yyyy-dd-mm as Timestamp if valid, else None."""
+    m = re.match(r"^\s*(\d{4})-(\d{1,2})-(\d{1,2})\s*$", str(ts_str))
+    if not m: return None
+    yyyy, mm, dd = map(int, m.groups())
+    try:
+        return pd.Timestamp(year=yyyy, month=dd, day=mm)  # swap mm<->dd
+    except Exception:
+        return None
 
 def _parse_time_str(s: str):
     """Return a time() if we can parse; else None."""
@@ -141,14 +138,13 @@ def _parse_time_str(s: str):
 # --- Half-day helpers (Form categories first) ---
 def _clean_token(s: str | None) -> str | None:
     if s is None or (isinstance(s, float) and pd.isna(s)): return None
-    # Lowercase, strip, remove trailing punctuation/dashes
+    # Lowercase, trim, strip trailing punctuation/dashes
     t = re.sub(r"[\s\-–—]+$", "", str(s).strip().lower())
-    return t
+    return t or None
 
 def _norm_slot(s: str | None) -> str | None:
     """
     Normalise category text to one of: 'morning', 'afternoon', 'lunch', 'eod'.
-    Handles trailing punctuation like 'End of Day -'.
     """
     t = _clean_token(s)
     if not t: return None
@@ -180,9 +176,6 @@ def _half_hint(s: str | None):
 
 def _half_from_categories(start_slot: str | None, end_slot: str | None,
                           single_day: bool, is_first_day: bool, is_last_day: bool) -> str | None:
-    """
-    Decide half-day ('am'/'pm') from category slots before any time parsing.
-    """
     # Single-day rules
     if single_day:
         if start_slot == "morning" and end_slot == "lunch":
@@ -192,9 +185,8 @@ def _half_from_categories(start_slot: str | None, end_slot: str | None,
         if start_slot == "morning" and end_slot == "eod":
             return None  # full day
         if start_slot == "afternoon" and end_slot == "lunch":
-            return "pm"  # choose PM to avoid over-count
+            return "pm"
         return None
-
     # Multi-day edges
     if is_first_day and start_slot == "afternoon":
         return "pm"
@@ -254,6 +246,36 @@ def load_team() -> pd.DataFrame:
             .sort_values("Team Member")
             .reset_index(drop=True))
 
+def _needs_iso_swap(from_raw, until_raw, from_ts, until_ts) -> bool:
+    """
+    Decide if we should reinterpret ISO strings with dd/mm intent.
+    Criteria:
+      - both raw look like 'yyyy-mm-dd'
+      - both day and month <= 12 (otherwise the swap would be invalid)
+      - current span is large (> 14 days)
+      - swapped span is valid and strictly smaller
+    """
+    if not (_looks_iso_yyyy_mm_dd(from_raw) and _looks_iso_yyyy_mm_dd(until_raw)):
+        return False
+    # Extract ints
+    fy, fm, fd = map(int, str(from_raw).split("-"))
+    uy, um, ud = map(int, str(until_raw).split("-"))
+    if not (fm <= 12 and fd <= 12 and um <= 12 and ud <= 12):
+        return False
+    if pd.isna(from_ts) or pd.isna(until_ts):
+        return False
+    span = (until_ts - from_ts).days
+    if span <= 14:
+        return False
+    sf = _iso_swap_if_valid(from_raw)
+    su = _iso_swap_if_valid(until_raw)
+    if sf is None or su is None:
+        return False
+    if su < sf:
+        return False
+    swapped_span = (su - sf).days
+    return swapped_span < span
+
 @st.cache_data(ttl=60)
 def load_requests() -> pd.DataFrame:
     url = to_csv_export_url(REQUESTS_URL_EDIT)
@@ -268,10 +290,29 @@ def load_requests() -> pd.DataFrame:
         if c not in df.columns:
             df[c] = None
 
+    # Keep raw strings for contextual correction
+    df["From_raw"]  = df["From (Date)"].astype(str)
+    df["Until_raw"] = df["Until (Date)"].astype(str)
+
     # Clean + parse
     df["Team Member"]  = df["Team Member"].astype(str).map(lambda s: re.sub(r"\s+"," ",s).strip())
     df["From (Date)"]  = df["From (Date)"].map(_smart_date)
     df["Until (Date)"] = df["Until (Date)"].map(_smart_date)
+
+    # Contextual “shorter span” swap for ambiguous ISO rows
+    swaps = []
+    for i, r in df.iterrows():
+        fr, ur = r["From_raw"], r["Until_raw"]
+        ft, ut = r["From (Date)"], r["Until (Date)"]
+        if _needs_iso_swap(fr, ur, ft, ut):
+            sf = _iso_swap_if_valid(fr)
+            su = _iso_swap_if_valid(ur)
+            if sf is not None and su is not None:
+                df.at[i, "From (Date)"]  = sf
+                df.at[i, "Until (Date)"] = su
+                swaps.append(i)
+    # (Optional) uncomment to see how many swaps happened:
+    # st.caption(f"Adjusted {len(swaps)} ambiguous ISO date pair(s).")
 
     # Normalise type (defensive)
     def norm_type(x):
@@ -288,7 +329,7 @@ def load_requests() -> pd.DataFrame:
     # Valid rows only
     df = df.dropna(subset=["Team Member","Type","From (Date)","Until (Date)"])
     df = df[df["Until (Date)"] >= df["From (Date)"]]
-    return df
+    return df.drop(columns=["From_raw","Until_raw"])
 
 @st.cache_data(ttl=86400)
 def fetch_govuk_bank_holidays_eng() -> set[pd.Timestamp]:
@@ -303,11 +344,10 @@ def fetch_govuk_bank_holidays_eng() -> set[pd.Timestamp]:
 
 def classify_half_for_date(row, date_ts: pd.Timestamp):
     """
-    Determine if 'date_ts' within a booking row is full, morning half ('am') or afternoon half ('pm').
+    Decide full vs half day for a given date in a booking.
     Priority:
-      1) Form categories: Start(Morning/Afternoon), End(Lunchtime/End of Day)
-      2) Fallback to explicit times and text hints
-    Only single-day or first/last day of a span can be half-days.
+      1) Form categories (Morning/Afternoon + Lunchtime/End of Day)
+      2) Only if inconclusive, fallback to explicit times / hints.
     """
     from_d = row["From (Date)"].normalize()
     until_d = row["Until (Date)"].normalize()
@@ -320,12 +360,13 @@ def classify_half_for_date(row, date_ts: pd.Timestamp):
     is_first   = (date_ts.normalize() == from_d)
     is_last    = (date_ts.normalize() == until_d)
 
-    # 1) Prefer categorical interpretation
+    # 1) Categories (final if decisive)
     cat_half = _half_from_categories(start_slot, end_slot, single_day, is_first, is_last)
-    if cat_half in ("am", "pm"):
+    if cat_half in ("am", "pm") or (single_day and start_slot and end_slot):
+        # If single-day and both slots present but not matching our patterns, treat as full
         return cat_half
 
-    # 2) Fallback to concrete times / hints (only if categories inconclusive)
+    # 2) Fallback to concrete times/hints
     st_t, en_t = _parse_time_str(st_raw), _parse_time_str(en_raw)
     st_hint, en_hint = _half_hint(st_raw), _half_hint(en_raw)
 
@@ -419,7 +460,7 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-# Branded header card
+# Header
 st.markdown(
     f"""
     <div style="
@@ -511,7 +552,6 @@ def allowance_for(member, yr):
 with st.container():
     st.markdown("<div class='bdi-card'>", unsafe_allow_html=True)
 
-    # badge showing current scope
     scope_txt = "Approved only" if not show_pending else "Approved + Pending"
     st.markdown(
         f"<div style='margin:0 0 8px 0;color:{MUTED};font:12px system-ui'>Viewing: "
@@ -526,8 +566,6 @@ with st.container():
 
     rows=[]
     render_team = df_team if (office == "Whole Team" or df_team.empty) else df_team[df_team["Office"]==office]
-
-    # Priority if ever overlapping types (sickness over AL)
     type_priority = {"Sickness": 2, "Annual Leave": 1}
 
     for _, r in render_team.iterrows():
@@ -544,7 +582,6 @@ with st.container():
         for d in dates:
             is_bh = is_bank_holiday(d)
             bg = WEEKEND if (d.weekday()>=5 or is_bh) else "#fff"
-            # Full CSS border string (fix 'today' highlight)
             border_css = f"2px dashed {MUTED}" if d==today else f"1px solid {GRID}"
 
             recs = md[md["Date"]==d]
@@ -553,15 +590,13 @@ with st.container():
                 recs["prio"] = recs["Type"].map(lambda t: type_priority.get(t, 0))
                 rec = recs.sort_values("prio", ascending=False).iloc[0]
                 t = rec["Type"]
-                status = rec["Status"]  # "Approved" or "Pending"
-                half = rec["Half"]      # None / "am" / "pm"
+                status = rec["Status"]
+                half = rec["Half"]
 
                 color = TYPE_COLORS.get(t, PRIMARY)
                 label = TYPE_LABELS.get(t,"")
-                # Text colour: white for AL approved full-days; black otherwise for readability
                 txt = "#fff" if (t=="Annual Leave" and status=="Approved" and (half is None)) else "#000"
 
-                # Pending visuals (translucent + dashed)
                 if status == "Pending":
                     rgba = hex_to_rgba(color, 0.18)
                     if half == "am":
@@ -574,7 +609,6 @@ with st.container():
                         f"<td style='background:{bg_style};border:2px dashed {color};width:28px;text-align:center;font-weight:800'>{label}</td>"
                     )
                 else:
-                    # Approved visuals
                     if half == "am":
                         bg_style = f"linear-gradient(135deg, {color} 0 50%, #fff 50% 100%)"
                         row.append(
