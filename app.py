@@ -50,58 +50,88 @@ def _normalize_slashes(s: str) -> str:
 
 def _smart_date(val):
     """
-    UK-first extractor that ALWAYS treats the first two numbers as dd/mm,
-    ignoring any trailing time/text. Handles:
-      - dd/mm[/yyyy]   (yyyy optional; yy -> 20yy; missing year -> current year)
-      - ISO yyyy-mm-dd (or yyyy/mm/dd)
+    UK-first extractor that **never** guesses US order.
+    Handles:
+      - dd/mm[/yyyy] (yyyy optional; yy -> 20yy; missing year -> current year)
+      - 'yyyy-mm-dd' (CSV/Sheets export) — we **swap** mm<->dd to honour original dd/mm intent when valid
+      - ISO yyyy-mm-dd or yyyy/mm/dd (kept if not swapped)
       - Excel serials
-    Absolutely no mm/dd guesses.
+      - Fallback: dayfirst=True
     """
     if pd.isna(val):
         return pd.NaT
     s = str(val).strip()
     if not s:
         return pd.NaT
-    s = _normalize_slashes(s)
 
-    # 1) Day-first tokeniser: dd sep mm [sep yyyy] with possible trailing stuff we ignore
-    m = re.match(r"^\s*(\d{1,2})\D(\d{1,2})(?:\D(\d{2,4}))?", s)
+    s_norm = _normalize_slashes(s)
+
+    # 0) If it looks like 'yyyy-mm-dd' (or with slashes), try a **safe day/month swap** first.
+    m_iso = re.match(r"^\s*(\d{4})[-/](\d{1,2})[-/](\d{1,2})\s*$", s)
+    if m_iso:
+        yyyy, mm, dd = map(int, m_iso.groups())
+        # Try swap (treat as dd/mm from an originally dd/mm/yyyy form)
+        try:
+            swapped = pd.Timestamp(year=yyyy, month=dd, day=mm)  # yyyy-dd-mm
+            return swapped
+        except Exception:
+            # If swap invalid (e.g., dd>12 but mm<=12), fall back to true ISO
+            try:
+                return pd.Timestamp(year=yyyy, month=mm, day=dd)
+            except Exception:
+                pass  # continue to other strategies
+
+    # 1) dd/mm/yyyy
+    m = re.match(r"^\s*(\d{1,2})/(\d{1,2})/(\d{4})\s*$", s_norm)
     if m:
-        dd, mm, yyyy = m.groups()
-        dd, mm = int(dd), int(mm)
-        if yyyy is None:
-            yyyy = dt.datetime.now().year
-        else:
-            yyyy = int(yyyy)
-            if yyyy < 100:  # yy -> 20yy
-                yyyy += 2000
+        dd, mm, yyyy = map(int, m.groups())
         try:
             return pd.Timestamp(year=yyyy, month=mm, day=dd)
         except Exception:
-            # fall through to other strategies
+            return pd.NaT
+
+    # 2) dd/mm/yy  -> assume 20yy
+    m = re.match(r"^\s*(\d{1,2})/(\d{1,2})/(\d{2})\s*$", s_norm)
+    if m:
+        dd, mm, yy = map(int, m.groups())
+        yyyy = 2000 + yy
+        try:
+            return pd.Timestamp(year=yyyy, month=mm, day=dd)
+        except Exception:
+            return pd.NaT
+
+    # 3) dd/mm (assume current year)
+    m = re.match(r"^\s*(\d{1,2})/(\d{1,2})\s*$", s_norm)
+    if m:
+        dd, mm = map(int, m.groups())
+        yyyy = dt.datetime.now().year
+        try:
+            return pd.Timestamp(year=yyyy, month=mm, day=dd)
+        except Exception:
+            return pd.NaT
+
+    # 4) ISO-like (yyyy-mm-dd or yyyy/mm/dd) that didn't match above (rare trailing text)
+    m_iso2 = re.match(r"^\s*(\d{4})[-/](\d{2})[-/](\d{2})", s_norm)
+    if m_iso2:
+        yyyy, mm, dd = map(int, m_iso2.groups())
+        try:
+            return pd.Timestamp(year=yyyy, month=mm, day=dd)
+        except Exception:
             pass
 
-    # 2) ISO yyyy-mm-dd (or /)
-    if re.match(r"^\d{4}[-/]\d{2}[-/]\d{2}", s):
-        d = pd.to_datetime(s.replace("/", "-"), errors="coerce", utc=False)
-        if pd.notna(d):
-            return d
-
-    # 3) Excel serial
+    # 5) Excel serial (numeric)
     n = pd.to_numeric(s, errors="coerce")
     if pd.notna(n):
         return pd.to_datetime(n, unit="d", origin="1899-12-30", errors="coerce")
 
-    # 4) Last resort: still UK
+    # 6) Last resort: still UK
     return pd.to_datetime(s, dayfirst=True, errors="coerce", utc=False)
 
 def _parse_time_str(s: str):
     """Return a time() if we can parse; else None."""
-    if pd.isna(s):
-        return None
+    if s is None or (isinstance(s, float) and pd.isna(s)): return None
     s = str(s).strip()
-    if not s:
-        return None
+    if not s: return None
     try:
         t = pd.to_datetime(s, errors="coerce").time()
         return t
@@ -109,47 +139,43 @@ def _parse_time_str(s: str):
         return None
 
 # --- Half-day helpers (Form categories first) ---
-def _norm_slot(s: str) -> str | None:
+def _clean_token(s: str | None) -> str | None:
+    if s is None or (isinstance(s, float) and pd.isna(s)): return None
+    # Lowercase, strip, remove trailing punctuation/dashes
+    t = re.sub(r"[\s\-–—]+$", "", str(s).strip().lower())
+    return t
+
+def _norm_slot(s: str | None) -> str | None:
     """
     Normalise category text to one of: 'morning', 'afternoon', 'lunch', 'eod'.
-    Prefer exact Form options first; then regex fallbacks for variants.
+    Handles trailing punctuation like 'End of Day -'.
     """
-    if s is None or (isinstance(s, float) and pd.isna(s)):
-        return None
-    t_raw = str(s).strip()
-    t = t_raw.lower()
+    t = _clean_token(s)
+    if not t: return None
 
-    # Exact option matches (preferred)
+    # Exact options first
     EXACT = {
         "morning": "morning",
         "afternoon": "afternoon",
         "lunchtime": "lunch",
         "end of day": "eod",
-        "end of day.": "eod",
+        "eod": "eod",
     }
-    if t in EXACT:
-        return EXACT[t]
+    if t in EXACT: return EXACT[t]
 
-    # Common variant mappings
-    if re.search(r"\bmorn(ing)?\b", t):
-        return "morning"
-    if re.search(r"\bafternoon\b|\bafter\s*noon\b|\bpm\b", t):
-        return "afternoon"
-    if re.search(r"\blunch\s*time\b|\blunchtime\b|\bmid\s*day\b", t):
-        return "lunch"
-    if re.search(r"\bend\s*of\s*day\b|\beod\b|\bclose\b|\bend\b", t):
-        return "eod"
+    # Common variants
+    if re.search(r"\bmorn(ing)?\b", t): return "morning"
+    if re.search(r"\bafternoon\b|\bafter\s*noon\b|\bpm\b", t): return "afternoon"
+    if re.search(r"\blunch\s*time\b|\blunchtime\b|\bmid\s*day\b", t): return "lunch"
+    if re.search(r"\bend\s*of\s*day\b|\beod\b|\bclose\b|\bend\b", t): return "eod"
     return None
 
-def _half_hint(s: str):
+def _half_hint(s: str | None):
     """Fallback: 'am'/'pm' if free text clearly indicates half-day."""
-    if pd.isna(s):
-        return None
-    s = str(s).strip().lower()
-    if re.search(r"\b(am|morning|a\.m\.)\b", s):
-        return "am"
-    if re.search(r"\b(pm|afternoon|p\.m\.)\b", s):
-        return "pm"
+    t = _clean_token(s)
+    if not t: return None
+    if re.search(r"\b(am|morning|a\.m\.)\b", t): return "am"
+    if re.search(r"\b(pm|afternoon|p\.m\.)\b", t): return "pm"
     return None
 
 def _half_from_categories(start_slot: str | None, end_slot: str | None,
@@ -166,8 +192,7 @@ def _half_from_categories(start_slot: str | None, end_slot: str | None,
         if start_slot == "morning" and end_slot == "eod":
             return None  # full day
         if start_slot == "afternoon" and end_slot == "lunch":
-            # Ambiguous in real life; treat as PM half (afternoon-only)
-            return "pm"
+            return "pm"  # choose PM to avoid over-count
         return None
 
     # Multi-day edges
@@ -300,7 +325,7 @@ def classify_half_for_date(row, date_ts: pd.Timestamp):
     if cat_half in ("am", "pm"):
         return cat_half
 
-    # 2) Fallback to concrete times / hints
+    # 2) Fallback to concrete times / hints (only if categories inconclusive)
     st_t, en_t = _parse_time_str(st_raw), _parse_time_str(en_raw)
     st_hint, en_hint = _half_hint(st_raw), _half_hint(en_raw)
 
