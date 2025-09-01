@@ -44,46 +44,78 @@ def to_csv_export_url(edit_url: str) -> str:
         return edit_url.replace("/edit#gid=", "/export?format=csv&gid=")
     return edit_url.replace("/edit", "/export?format=csv")
 
+def _normalize_slashes(s: str) -> str:
+    # Replace common separators with "/"
+    return re.sub(r"[.\-–—\s]+", "/", s)
+
 def _smart_date(val):
-    """Robust UK-first parser: dd/mm/yyyy wins; then ISO; then dayfirst; then serial."""
-    if pd.isna(val): 
+    """
+    UK-first parser with strict handling of short dates to avoid US month/day:
+    - dd/mm/yyyy
+    - dd/mm/yy -> 20yy
+    - dd/mm    -> assumes current year
+    - ISO yyyy-mm-dd (or yyyy/mm/dd)
+    - Excel serials
+    - Fallback: dayfirst=True
+    """
+    if pd.isna(val):
         return pd.NaT
     s = str(val).strip()
+    if not s:
+        return pd.NaT
 
-    # UK dd/mm/yyyy
-    if re.match(r"^\d{1,2}/\d{1,2}/\d{4}$", s):
+    s = _normalize_slashes(s)
+
+    # dd/mm/yyyy
+    m = re.match(r"^\s*(\d{1,2})/(\d{1,2})/(\d{4})\s*$", s)
+    if m:
+        dd, mm, yyyy = map(int, m.groups())
         try:
-            dd, mm, yyyy = map(int, s.split("/"))
             return pd.Timestamp(year=yyyy, month=mm, day=dd)
         except Exception:
-            pass
+            return pd.NaT
 
-    # ISO yyyy-mm-dd
-    if re.match(r"^\d{4}-\d{2}-\d{2}", s):
-        d = pd.to_datetime(s, errors="coerce", utc=False)
-        if pd.notna(d): 
+    # dd/mm/yy  -> assume 20yy
+    m = re.match(r"^\s*(\d{1,2})/(\d{1,2})/(\d{2})\s*$", s)
+    if m:
+        dd, mm, yy = map(int, m.groups())
+        yyyy = 2000 + yy
+        try:
+            return pd.Timestamp(year=yyyy, month=mm, day=dd)
+        except Exception:
+            return pd.NaT
+
+    # dd/mm (assume current year)
+    m = re.match(r"^\s*(\d{1,2})/(\d{1,2})\s*$", s)
+    if m:
+        dd, mm = map(int, m.groups())
+        yyyy = dt.datetime.now().year
+        try:
+            return pd.Timestamp(year=yyyy, month=mm, day=dd)
+        except Exception:
+            return pd.NaT
+
+    # ISO-like (yyyy-mm-dd) or (yyyy/mm/dd)
+    if re.match(r"^\d{4}[-/]\d{2}[-/]\d{2}$", s):
+        d = pd.to_datetime(s.replace("/", "-"), errors="coerce", utc=False)
+        if pd.notna(d):
             return d
 
-    # General parse (UK preference)
-    d = pd.to_datetime(s, dayfirst=True, errors="coerce", utc=False)
-    if pd.notna(d):
-        return d
-
-    # Excel serials
+    # Excel serials (numeric only)
     n = pd.to_numeric(s, errors="coerce")
     if pd.notna(n):
         return pd.to_datetime(n, unit="d", origin="1899-12-30", errors="coerce")
 
-    return pd.NaT
+    # Fallback: UK preference
+    return pd.to_datetime(s, dayfirst=True, errors="coerce", utc=False)
 
 def _parse_time_str(s: str):
     """Return a time() if we can parse; else None."""
-    if pd.isna(s): 
+    if pd.isna(s):
         return None
     s = str(s).strip()
     if not s:
         return None
-    # Common text shorthands won't parse to time; handle later via hints.
     try:
         t = pd.to_datetime(s, errors="coerce").time()
         return t
@@ -92,18 +124,61 @@ def _parse_time_str(s: str):
 
 def _half_hint(s: str):
     """Return 'am'/'pm' if the free text clearly indicates half-day."""
-    if pd.isna(s): 
+    if pd.isna(s):
         return None
     s = str(s).strip().lower()
-    # Be careful: '12:00pm' contains 'pm' but is a time; we only hit this if parse failed.
-    if re.search(r"\b(am|morning|a\.m\.|half day am|half-day am|am half)\b", s):
+    if re.search(r"\b(am|morning|a\.m\.|half\s*day\s*am|half-?day\s*am|am\s*half)\b", s):
         return "am"
-    if re.search(r"\b(pm|afternoon|p\.m\.|half day pm|half-day pm|pm half)\b", s):
+    if re.search(r"\b(pm|afternoon|p\.m\.|half\s*day\s*pm|half-?day\s*pm|pm\s*half)\b", s):
         return "pm"
     return None
 
+def _norm_slot(s: str) -> str | None:
+    """Normalise category text to tokens: 'morning', 'afternoon', 'lunch', 'eod'."""
+    if s is None or (isinstance(s, float) and pd.isna(s)):
+        return None
+    t = str(s).strip().lower()
+    if not t:
+        return None
+    # Start-time buckets
+    if re.search(r"\bmorn(ing)?\b", t):
+        return "morning"
+    if re.search(r"\bafter\s*noon|\bpm\b|\bafternoon\b", t):
+        return "afternoon"
+    # End-time buckets
+    if re.search(r"\blunch(time)?\b|\bmid\s*day\b", t):
+        return "lunch"
+    if re.search(r"end\s*of\s*day|\beod\b|\bclose\b|\bend\b", t):
+        return "eod"
+    return None
+
+def _half_from_categories(start_slot: str | None, end_slot: str | None,
+                          single_day: bool, is_first_day: bool, is_last_day: bool) -> str | None:
+    """
+    Decide half-day ('am'/'pm') from category slots before any time parsing.
+    single_day: booking is exactly one day long
+    """
+    # Single-day rules
+    if single_day:
+        if start_slot == "morning" and end_slot == "lunch":
+            return "am"
+        if start_slot == "afternoon" and end_slot == "eod":
+            return "pm"
+        if start_slot == "morning" and end_slot == "eod":
+            return None  # full day
+        if start_slot == "afternoon" and end_slot == "lunch":
+            # Ambiguous; lean to PM half to avoid over-counting
+            return "pm"
+        return None
+
+    # Multi-day edges
+    if is_first_day and start_slot == "afternoon":
+        return "pm"
+    if is_last_day and end_slot == "lunch":
+        return "am"
+    return None
+
 def hex_to_rgba(hex_color: str, alpha: float) -> str:
-    """Convert #rrggbb to rgba(r,g,b,a)."""
     h = hex_color.lstrip("#")
     r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
     return f"rgba({r},{g},{b},{alpha})"
@@ -159,14 +234,14 @@ def load_team() -> pd.DataFrame:
 def load_requests() -> pd.DataFrame:
     url = to_csv_export_url(REQUESTS_URL_EDIT)
     df = read_csv(url)
-    if df.empty: 
+    if df.empty:
         return df
     df = df.rename(columns=lambda c: str(c).strip())
 
     # Ensure expected columns
     for c in ["Team Member","Type","From (Date)","Until (Date)","Start Time","End Time",
               "Office","Line Manager","Notes","Status"]:
-        if c not in df.columns: 
+        if c not in df.columns:
             df[c] = None
 
     # Clean + parse
@@ -204,52 +279,52 @@ def fetch_govuk_bank_holidays_eng() -> set[pd.Timestamp]:
 
 def classify_half_for_date(row, date_ts: pd.Timestamp):
     """
-    Determine if a given 'date_ts' within a booking row is full, morning half ('am') or afternoon half ('pm').
-    Uses Start/End Time and free-text hints. Only single-day or first/last day of a span can be half-days.
+    Determine if 'date_ts' within a booking row is full, morning half ('am') or afternoon half ('pm').
+    Priority:
+      1) Form categories: Start(Morning/Afternoon), End(Lunchtime/End of Day)
+      2) Fallback to explicit times and text hints
+    Only single-day or first/last day of a span can be half-days.
     """
     from_d = row["From (Date)"].normalize()
     until_d = row["Until (Date)"].normalize()
-    st_raw, en_raw = row.get("Start Time", None), row.get("End Time", None)
 
-    # Try proper time parsing first
+    st_raw, en_raw = row.get("Start Time", None), row.get("End Time", None)
+    start_slot = _norm_slot(st_raw)
+    end_slot   = _norm_slot(en_raw)
+
+    single_day = (from_d == until_d)
+    is_first   = (date_ts.normalize() == from_d)
+    is_last    = (date_ts.normalize() == until_d)
+
+    # 1) Prefer categorical interpretation
+    cat_half = _half_from_categories(start_slot, end_slot, single_day, is_first, is_last)
+    if cat_half in ("am", "pm"):
+        return cat_half
+
+    # 2) Fallback to concrete times / hints
     st_t, en_t = _parse_time_str(st_raw), _parse_time_str(en_raw)
-    # Then text hints if times weren't clear
     st_hint, en_hint = _half_hint(st_raw), _half_hint(en_raw)
 
-    NOON = dt.time(12, 0)
+    NOON   = dt.time(12, 0)
     ONE_PM = dt.time(13, 0)
 
     def am_half_by_time():
-        # Morning half if we only cover morning; end by ~1pm or explicit hint
-        if en_t and (en_t <= ONE_PM):
-            return True
-        if st_hint == "am" or en_hint == "am":
-            return True
+        if en_t and (en_t <= ONE_PM): return True
+        if st_hint == "am" or en_hint == "am": return True
         return False
 
     def pm_half_by_time():
-        # Afternoon half if we start around/after noon
-        if st_t and (st_t >= NOON):
-            return True
-        if st_hint == "pm" or en_hint == "pm":
-            return True
+        if st_t and (st_t >= NOON): return True
+        if st_hint == "pm" or en_hint == "pm": return True
         return False
 
-    # Single-day booking
-    if from_d == until_d == date_ts.normalize():
-        if am_half_by_time() and not pm_half_by_time():
-            return "am"
-        if pm_half_by_time() and not am_half_by_time():
-            return "pm"
-        return None  # full day
+    if single_day and is_first and is_last:
+        if am_half_by_time() and not pm_half_by_time(): return "am"
+        if pm_half_by_time() and not am_half_by_time(): return "pm"
+        return None
 
-    # Multi-day: only the edges can be half
-    if date_ts.normalize() == from_d:
-        if pm_half_by_time():
-            return "pm"
-    if date_ts.normalize() == until_d:
-        if am_half_by_time():
-            return "am"
+    if is_first and pm_half_by_time(): return "pm"
+    if is_last  and am_half_by_time(): return "am"
     return None
 
 def explode_days(df: pd.DataFrame) -> pd.DataFrame:
@@ -460,7 +535,7 @@ with st.container():
 
                 color = TYPE_COLORS.get(t, PRIMARY)
                 label = TYPE_LABELS.get(t,"")
-                # Text colour: white for AL approved; black otherwise
+                # Text colour: white for AL approved full-days; black otherwise for readability
                 txt = "#fff" if (t=="Annual Leave" and status=="Approved" and (half is None)) else "#000"
 
                 # Pending visuals
