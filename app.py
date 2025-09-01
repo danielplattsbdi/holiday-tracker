@@ -50,63 +50,49 @@ def _normalize_slashes(s: str) -> str:
 
 def _smart_date(val):
     """
-    UK-first parser with strict handling of short dates to avoid US month/day:
-    - dd/mm/yyyy
-    - dd/mm/yy -> 20yy
-    - dd/mm    -> assumes current year
-    - ISO yyyy-mm-dd (or yyyy/mm/dd)
-    - Excel serials
-    - Fallback: dayfirst=True
+    UK-first extractor that ALWAYS treats the first two numbers as dd/mm,
+    ignoring any trailing time/text. Handles:
+      - dd/mm[/yyyy]   (yyyy optional; yy -> 20yy; missing year -> current year)
+      - ISO yyyy-mm-dd (or yyyy/mm/dd)
+      - Excel serials
+    Absolutely no mm/dd guesses.
     """
     if pd.isna(val):
         return pd.NaT
     s = str(val).strip()
     if not s:
         return pd.NaT
-
     s = _normalize_slashes(s)
 
-    # dd/mm/yyyy
-    m = re.match(r"^\s*(\d{1,2})/(\d{1,2})/(\d{4})\s*$", s)
+    # 1) Day-first tokeniser: dd sep mm [sep yyyy] with possible trailing stuff we ignore
+    m = re.match(r"^\s*(\d{1,2})\D(\d{1,2})(?:\D(\d{2,4}))?", s)
     if m:
-        dd, mm, yyyy = map(int, m.groups())
+        dd, mm, yyyy = m.groups()
+        dd, mm = int(dd), int(mm)
+        if yyyy is None:
+            yyyy = dt.datetime.now().year
+        else:
+            yyyy = int(yyyy)
+            if yyyy < 100:  # yy -> 20yy
+                yyyy += 2000
         try:
             return pd.Timestamp(year=yyyy, month=mm, day=dd)
         except Exception:
-            return pd.NaT
+            # fall through to other strategies
+            pass
 
-    # dd/mm/yy  -> assume 20yy
-    m = re.match(r"^\s*(\d{1,2})/(\d{1,2})/(\d{2})\s*$", s)
-    if m:
-        dd, mm, yy = map(int, m.groups())
-        yyyy = 2000 + yy
-        try:
-            return pd.Timestamp(year=yyyy, month=mm, day=dd)
-        except Exception:
-            return pd.NaT
-
-    # dd/mm (assume current year)
-    m = re.match(r"^\s*(\d{1,2})/(\d{1,2})\s*$", s)
-    if m:
-        dd, mm = map(int, m.groups())
-        yyyy = dt.datetime.now().year
-        try:
-            return pd.Timestamp(year=yyyy, month=mm, day=dd)
-        except Exception:
-            return pd.NaT
-
-    # ISO-like (yyyy-mm-dd) or (yyyy/mm/dd)
-    if re.match(r"^\d{4}[-/]\d{2}[-/]\d{2}$", s):
+    # 2) ISO yyyy-mm-dd (or /)
+    if re.match(r"^\d{4}[-/]\d{2}[-/]\d{2}", s):
         d = pd.to_datetime(s.replace("/", "-"), errors="coerce", utc=False)
         if pd.notna(d):
             return d
 
-    # Excel serials (numeric only)
+    # 3) Excel serial
     n = pd.to_numeric(s, errors="coerce")
     if pd.notna(n):
         return pd.to_datetime(n, unit="d", origin="1899-12-30", errors="coerce")
 
-    # Fallback: UK preference
+    # 4) Last resort: still UK
     return pd.to_datetime(s, dayfirst=True, errors="coerce", utc=False)
 
 def _parse_time_str(s: str):
@@ -122,41 +108,54 @@ def _parse_time_str(s: str):
     except Exception:
         return None
 
+# --- Half-day helpers (Form categories first) ---
+def _norm_slot(s: str) -> str | None:
+    """
+    Normalise category text to one of: 'morning', 'afternoon', 'lunch', 'eod'.
+    Prefer exact Form options first; then regex fallbacks for variants.
+    """
+    if s is None or (isinstance(s, float) and pd.isna(s)):
+        return None
+    t_raw = str(s).strip()
+    t = t_raw.lower()
+
+    # Exact option matches (preferred)
+    EXACT = {
+        "morning": "morning",
+        "afternoon": "afternoon",
+        "lunchtime": "lunch",
+        "end of day": "eod",
+        "end of day.": "eod",
+    }
+    if t in EXACT:
+        return EXACT[t]
+
+    # Common variant mappings
+    if re.search(r"\bmorn(ing)?\b", t):
+        return "morning"
+    if re.search(r"\bafternoon\b|\bafter\s*noon\b|\bpm\b", t):
+        return "afternoon"
+    if re.search(r"\blunch\s*time\b|\blunchtime\b|\bmid\s*day\b", t):
+        return "lunch"
+    if re.search(r"\bend\s*of\s*day\b|\beod\b|\bclose\b|\bend\b", t):
+        return "eod"
+    return None
+
 def _half_hint(s: str):
-    """Return 'am'/'pm' if the free text clearly indicates half-day."""
+    """Fallback: 'am'/'pm' if free text clearly indicates half-day."""
     if pd.isna(s):
         return None
     s = str(s).strip().lower()
-    if re.search(r"\b(am|morning|a\.m\.|half\s*day\s*am|half-?day\s*am|am\s*half)\b", s):
+    if re.search(r"\b(am|morning|a\.m\.)\b", s):
         return "am"
-    if re.search(r"\b(pm|afternoon|p\.m\.|half\s*day\s*pm|half-?day\s*pm|pm\s*half)\b", s):
+    if re.search(r"\b(pm|afternoon|p\.m\.)\b", s):
         return "pm"
-    return None
-
-def _norm_slot(s: str) -> str | None:
-    """Normalise category text to tokens: 'morning', 'afternoon', 'lunch', 'eod'."""
-    if s is None or (isinstance(s, float) and pd.isna(s)):
-        return None
-    t = str(s).strip().lower()
-    if not t:
-        return None
-    # Start-time buckets
-    if re.search(r"\bmorn(ing)?\b", t):
-        return "morning"
-    if re.search(r"\bafter\s*noon|\bpm\b|\bafternoon\b", t):
-        return "afternoon"
-    # End-time buckets
-    if re.search(r"\blunch(time)?\b|\bmid\s*day\b", t):
-        return "lunch"
-    if re.search(r"end\s*of\s*day|\beod\b|\bclose\b|\bend\b", t):
-        return "eod"
     return None
 
 def _half_from_categories(start_slot: str | None, end_slot: str | None,
                           single_day: bool, is_first_day: bool, is_last_day: bool) -> str | None:
     """
     Decide half-day ('am'/'pm') from category slots before any time parsing.
-    single_day: booking is exactly one day long
     """
     # Single-day rules
     if single_day:
@@ -167,7 +166,7 @@ def _half_from_categories(start_slot: str | None, end_slot: str | None,
         if start_slot == "morning" and end_slot == "eod":
             return None  # full day
         if start_slot == "afternoon" and end_slot == "lunch":
-            # Ambiguous; lean to PM half to avoid over-counting
+            # Ambiguous in real life; treat as PM half (afternoon-only)
             return "pm"
         return None
 
@@ -525,7 +524,6 @@ with st.container():
 
             recs = md[md["Date"]==d]
             if not recs.empty and (d.weekday()<5 and not is_bh):
-                # choose best by priority
                 recs = recs.copy()
                 recs["prio"] = recs["Type"].map(lambda t: type_priority.get(t, 0))
                 rec = recs.sort_values("prio", ascending=False).iloc[0]
@@ -538,7 +536,7 @@ with st.container():
                 # Text colour: white for AL approved full-days; black otherwise for readability
                 txt = "#fff" if (t=="Annual Leave" and status=="Approved" and (half is None)) else "#000"
 
-                # Pending visuals
+                # Pending visuals (translucent + dashed)
                 if status == "Pending":
                     rgba = hex_to_rgba(color, 0.18)
                     if half == "am":
