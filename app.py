@@ -258,8 +258,11 @@ def _needs_iso_swap(from_raw, until_raw, from_ts, until_ts) -> bool:
     if not (_looks_iso_yyyy_mm_dd(from_raw) and _looks_iso_yyyy_mm_dd(until_raw)):
         return False
     # Extract ints
-    fy, fm, fd = map(int, str(from_raw).split("-"))
-    uy, um, ud = map(int, str(until_raw).split("-"))
+    try:
+        fy, fm, fd = map(int, str(from_raw).split("-"))
+        uy, um, ud = map(int, str(until_raw).split("-"))
+    except Exception:
+        return False
     if not (fm <= 12 and fd <= 12 and um <= 12 and ud <= 12):
         return False
     if pd.isna(from_ts) or pd.isna(until_ts):
@@ -311,7 +314,6 @@ def load_requests() -> pd.DataFrame:
                 df.at[i, "From (Date)"]  = sf
                 df.at[i, "Until (Date)"] = su
                 swaps.append(i)
-    # (Optional) uncomment to see how many swaps happened:
     # st.caption(f"Adjusted {len(swaps)} ambiguous ISO date pair(s).")
 
     # Normalise type (defensive)
@@ -345,14 +347,18 @@ def fetch_govuk_bank_holidays_eng() -> set[pd.Timestamp]:
 def classify_half_for_date(row, date_ts: pd.Timestamp):
     """
     Decide full vs half day for a given date in a booking.
+
     Priority:
-      1) Form categories (Morning/Afternoon + Lunchtime/End of Day)
-      2) Only if inconclusive, fallback to explicit times / hints.
+      1) Form categories (Morning/Afternoon + Lunchtime/End of Day) — authoritative.
+         If categories are present but don't imply a half-day, treat as FULL (no fallback).
+      2) Only if BOTH category fields are missing, fall back to explicit times / hints,
+         using edge-specific logic (first day uses start info; last day uses end info).
     """
     from_d = row["From (Date)"].normalize()
     until_d = row["Until (Date)"].normalize()
 
-    st_raw, en_raw = row.get("Start Time", None), row.get("End Time", None)
+    st_raw = row.get("Start Time", None)
+    en_raw = row.get("End Time", None)
     start_slot = _norm_slot(st_raw)
     end_slot   = _norm_slot(en_raw)
 
@@ -360,36 +366,43 @@ def classify_half_for_date(row, date_ts: pd.Timestamp):
     is_first   = (date_ts.normalize() == from_d)
     is_last    = (date_ts.normalize() == until_d)
 
-    # 1) Categories (final if decisive)
+    # 1) Categories first (final if decisive)
     cat_half = _half_from_categories(start_slot, end_slot, single_day, is_first, is_last)
-    if cat_half in ("am", "pm") or (single_day and start_slot and end_slot):
-        # If single-day and both slots present but not matching our patterns, treat as full
+    if cat_half in ("am", "pm"):
         return cat_half
 
-    # 2) Fallback to concrete times/hints
-    st_t, en_t = _parse_time_str(st_raw), _parse_time_str(en_raw)
-    st_hint, en_hint = _half_hint(st_raw), _half_hint(en_raw)
+    # If any category value is present but non-decisive, treat as FULL (do not fall back).
+    if start_slot is not None or end_slot is not None:
+        return None
+
+    # 2) Fallback ONLY when both category fields are missing.
+    st_t   = _parse_time_str(st_raw)
+    en_t   = _parse_time_str(en_raw)
+    st_hint = _half_hint(st_raw)  # 'am'/'pm'/None
+    en_hint = _half_hint(en_raw)
 
     NOON   = dt.time(12, 0)
     ONE_PM = dt.time(13, 0)
 
-    def am_half_by_time():
-        if en_t and (en_t <= ONE_PM): return True
-        if st_hint == "am" or en_hint == "am": return True
-        return False
-
-    def pm_half_by_time():
-        if st_t and (st_t >= NOON): return True
-        if st_hint == "pm" or en_hint == "pm": return True
-        return False
-
     if single_day and is_first and is_last:
-        if am_half_by_time() and not pm_half_by_time(): return "am"
-        if pm_half_by_time() and not am_half_by_time(): return "pm"
+        # Single-day: use both ends
+        am_by_end   = (en_t and en_t <= ONE_PM) or (en_hint == "am")
+        pm_by_start = (st_t and st_t >= NOON)   or (st_hint == "pm")
+        if am_by_end and not pm_by_start: return "am"
+        if pm_by_start and not am_by_end: return "pm"
         return None
 
-    if is_first and pm_half_by_time(): return "pm"
-    if is_last  and am_half_by_time(): return "am"
+    # Multi-day edges: use edge-specific signals ONLY
+    if is_first:
+        if (st_t and st_t >= NOON) or (st_hint == "pm"):
+            return "pm"
+        return None
+    if is_last:
+        if (en_t and en_t <= ONE_PM) or (en_hint == "am"):
+            return "am"
+        return None
+
+    # Middle days are full
     return None
 
 def explode_days(df: pd.DataFrame) -> pd.DataFrame:
