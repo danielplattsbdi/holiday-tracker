@@ -257,7 +257,6 @@ def _needs_iso_swap(from_raw, until_raw, from_ts, until_ts) -> bool:
     """
     if not (_looks_iso_yyyy_mm_dd(from_raw) and _looks_iso_yyyy_mm_dd(until_raw)):
         return False
-    # Extract ints
     try:
         fy, fm, fd = map(int, str(from_raw).split("-"))
         uy, um, ud = map(int, str(until_raw).split("-"))
@@ -293,7 +292,7 @@ def load_requests() -> pd.DataFrame:
         if c not in df.columns:
             df[c] = None
 
-    # Keep raw strings for contextual correction
+    # Keep raw strings for contextual correction AND cancellation matching
     df["From_raw"]  = df["From (Date)"].astype(str)
     df["Until_raw"] = df["Until (Date)"].astype(str)
 
@@ -303,7 +302,6 @@ def load_requests() -> pd.DataFrame:
     df["Until (Date)"] = df["Until (Date)"].map(_smart_date)
 
     # Contextual “shorter span” swap for ambiguous ISO rows
-    swaps = []
     for i, r in df.iterrows():
         fr, ur = r["From_raw"], r["Until_raw"]
         ft, ut = r["From (Date)"], r["Until (Date)"]
@@ -313,8 +311,6 @@ def load_requests() -> pd.DataFrame:
             if sf is not None and su is not None:
                 df.at[i, "From (Date)"]  = sf
                 df.at[i, "Until (Date)"] = su
-                swaps.append(i)
-    # st.caption(f"Adjusted {len(swaps)} ambiguous ISO date pair(s).")
 
     # Normalise type (defensive)
     def norm_type(x):
@@ -331,7 +327,7 @@ def load_requests() -> pd.DataFrame:
     # Valid rows only
     df = df.dropna(subset=["Team Member","Type","From (Date)","Until (Date)"])
     df = df[df["Until (Date)"] >= df["From (Date)"]]
-    return df.drop(columns=["From_raw","Until_raw"])
+    return df  # <-- KEEP From_raw / Until_raw
 
 @st.cache_data(ttl=86400)
 def fetch_govuk_bank_holidays_eng() -> set[pd.Timestamp]:
@@ -726,22 +722,48 @@ else:
             st.caption("This will remove the selected row(s) from the **Requests** sheet and update the board immediately.")
 
         if pressed and picks:
-            errors = []
-            for _, r in member_reqs[member_reqs["Label"].isin(picks)].iterrows():
+            def try_cancel(member, type_str, from_val, until_val):
                 payload = {
                     "token": CANCEL_TOKEN,
-                    "member": r["Team Member"],
-                    "type": "Annual Leave",
-                    "from": r["From (Date)"].strftime("%d/%m/%Y"),
-                    "until": r["Until (Date)"].strftime("%d/%m/%Y"),
+                    "member": member,
+                    "type": type_str,
+                    "from": from_val,
+                    "until": until_val,
                 }
                 try:
                     resp = requests.post(CANCELLATION_ENDPOINT, json=payload, timeout=10)
-                    ok = resp.ok and resp.headers.get("content-type","").startswith("application/json") and resp.json().get("ok")
-                    if not ok:
-                        errors.append(resp.text)
+                    ok = resp.ok and resp.headers.get("content-type","").startswith("application/json")
+                    data = resp.json() if ok else {}
+                    return bool(data.get("ok")), (resp.text if not data.get("ok") else "")
                 except Exception as e:
-                    errors.append(str(e))
+                    return False, str(e)
+
+            errors = []
+            rows_to_cancel = member_reqs[member_reqs["Label"].isin(picks)].copy()
+
+            for _, r in rows_to_cancel.iterrows():
+                member   = str(r["Team Member"]).strip()
+                type_str = "Annual Leave"  # we only list AL in the cancel UI
+
+                # 1) Try EXACT raw strings from sheet (most reliable)
+                raw_from  = str(r.get("From_raw",  "" )).strip()
+                raw_until = str(r.get("Until_raw", "" )).strip()
+                ok, err = try_cancel(member, type_str, raw_from, raw_until)
+
+                # 2) Fallback: dd/mm/yyyy
+                if not ok and pd.notna(r["From (Date)"]) and pd.notna(r["Until (Date)"]):
+                    ddmm_from  = r["From (Date)"].strftime("%d/%m/%Y")
+                    ddmm_until = r["Until (Date)"].strftime("%d/%m/%Y")
+                    ok, err = try_cancel(member, type_str, ddmm_from, ddmm_until)
+
+                # 3) Fallback: yyyy-mm-dd
+                if not ok and pd.notna(r["From (Date)"]) and pd.notna(r["Until (Date)"]):
+                    iso_from  = r["From (Date)"].strftime("%Y-%m-%d")
+                    iso_until = r["Until (Date)"].strftime("%Y-%m-%d")
+                    ok, err = try_cancel(member, type_str, iso_from, iso_until)
+
+                if not ok:
+                    errors.append(err or f"Could not cancel: {member} {raw_from} → {raw_until}")
 
             if errors:
                 st.error("Some cancellations failed:\n\n" + "\n".join(errors))
